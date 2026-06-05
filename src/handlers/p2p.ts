@@ -525,41 +525,53 @@ private getSessionOptionLabel(session: OpencodeSession, highlightWorkspace: bool
   ): Promise<boolean> {
     const { chatId, messageId } = event;
 
-    const pending = permissionHandler.peekForChat(chatId);
-    if (!pending) {
+    if (!permissionHandler.peekForChat(chatId)) {
       return false;
     }
 
     const allow = command.permissionAllow ?? (command.permissionResponse === 'y');
     const remember = command.permissionRemember ?? false;
 
-    const responded = await activeBackend.respondToPermission(
-      pending.sessionId,
-      pending.permissionId,
-      allow,
-      remember
-    );
-
-    if (!responded) {
-      console.error(
-        `[P2P-权限] 响应失败: chat=${chatId}, session=${pending.sessionId}, permission=${pending.permissionId}`
+    // 子 agent 会连续产生多个权限请求，队首可能已在后端超时失效（僵尸）。
+    // 逐个尝试：响应失败说明该 permissionId 已失效，剔除后试下一个，
+    // 直到命中一个真正挂起的请求或队列耗尽。
+    let skipped = 0;
+    let pending = permissionHandler.peekForChat(chatId);
+    while (pending) {
+      const responded = await activeBackend.respondToPermission(
+        pending.sessionId,
+        pending.permissionId,
+        allow,
+        remember
       );
-      await this.safeReply(messageId, chatId, '权限响应失败，请重试');
-      return true;
+
+      // 无论成败都从队列剔除该项（失败=僵尸，成功=已处理）
+      permissionHandler.resolveForChat(chatId, pending.permissionId);
+
+      if (responded) {
+        const toolName = pending.tool || '工具';
+        console.log(
+          `[P2P-权限] 响应成功: chat=${chatId}, permission=${pending.permissionId}, allow=${allow}, remember=${remember}, skippedStale=${skipped}`
+        );
+        await this.safeReply(
+          messageId,
+          chatId,
+          allow
+            ? remember ? `✅ 已允许并记住权限：${toolName}` : `✅ 已允许权限：${toolName}`
+            : `❌ 已拒绝权限：${toolName}`
+        );
+        return true;
+      }
+
+      skipped++;
+      console.warn(
+        `[P2P-权限] 跳过失效请求: chat=${chatId}, permission=${pending.permissionId}(已超时/已处理)`
+      );
+      pending = permissionHandler.peekForChat(chatId);
     }
 
-    permissionHandler.resolveForChat(chatId, pending.permissionId);
-    const toolName = pending.tool || '工具';
-    console.log(
-      `[P2P-权限] 响应成功: chat=${chatId}, permission=${pending.permissionId}, allow=${allow}, remember=${remember}`
-    );
-    await this.safeReply(
-      messageId,
-      chatId,
-      allow
-        ? remember ? `✅ 已允许并记住权限：${toolName}` : `✅ 已允许权限：${toolName}`
-        : `❌ 已拒绝权限：${toolName}`
-    );
+    console.error(`[P2P-权限] 无有效挂起权限可响应: chat=${chatId}, skippedStale=${skipped}`);
+    await this.safeReply(messageId, chatId, '⚠️ 该权限请求已失效（可能已超时）。如仍需操作，请重新发起。');
     return true;
   }
 
