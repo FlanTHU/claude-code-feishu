@@ -1,5 +1,8 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
+// 防止 dotenv 从 .env 加载，确保测试可控制环境变量
+vi.mock('dotenv/config', () => ({}));
+
 const envKeys = [
   'DISCORD_ENABLED',
   'DISCORD_TOKEN',

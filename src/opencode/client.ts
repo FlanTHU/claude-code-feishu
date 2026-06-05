@@ -2,6 +2,7 @@ import { createOpencodeClient, type OpencodeClient as SdkOpencodeClient } from '
 import type { Session, Message, Part, Project } from '@opencode-ai/sdk';
 import { opencodeConfig, modelConfig } from '../config.js';
 import { EventEmitter } from 'events';
+import type { AiBackend } from '../backend/types.js';
 
 // 权限请求事件类型
 export interface PermissionRequestEvent {
@@ -319,14 +320,19 @@ function appendAuthHint(message: string, statusCode?: number): string {
   return `${message}；${buildAuthEnvHint()}`;
 }
 
-class OpencodeClientWrapper extends EventEmitter {
+class OpencodeClientWrapper extends EventEmitter implements AiBackend {
   private client: SdkOpencodeClient | null = null;
   private eventAbortController: AbortController | null = null;
   private eventReconnectTimer: NodeJS.Timeout | null = null;
   private eventReconnectAttempt = 0;
   private eventListeningEnabled = false;
   private eventStreamActive = false;
+  private lastHeartbeatAt = 0;
+  private heartbeatCheckTimer: ReturnType<typeof setInterval> | null = null;
   private directoryEventStreams: Map<string, DirectoryEventStreamEntry> = new Map();
+  private recentEventKeys: Map<string, number> = new Map();
+  private recentDeltaKeys: Map<string, number> = new Map();
+  private eventDedupCleanupTimer: ReturnType<typeof setInterval> | null = null;
   // 防止并发调用 ensureDirectoryEventStream 对同一目录建立多条 SSE 连接
   private pendingDirectoryStreams: Map<string, Promise<void>> = new Map();
 
@@ -395,7 +401,7 @@ class OpencodeClientWrapper extends EventEmitter {
       return;
     }
 
-    const maxBackoffMs = 15000;
+    const maxBackoffMs = opencodeConfig.eventMaxBackoffMs;
     const baseBackoffMs = 2000;
     const step = Math.min(this.eventReconnectAttempt, 4);
     const delay = Math.min(baseBackoffMs * Math.pow(2, step), maxBackoffMs);
@@ -437,6 +443,12 @@ class OpencodeClientWrapper extends EventEmitter {
 
   private async ensureDirectoryEventStream(directory: string): Promise<void> {
     if (!this.client || !this.eventListeningEnabled) {
+      return;
+    }
+
+    // 修复：如果全局事件流已激活，跳过目录事件流以避免重复事件
+    // 全局事件流已订阅所有事件，目录事件流会导致同一事件被处理两次
+    if (this.eventStreamActive) {
       return;
     }
 
@@ -543,6 +555,8 @@ class OpencodeClientWrapper extends EventEmitter {
       const events = await this.client.event.subscribe();
       console.log('[OpenCode] 事件流订阅成功');
       this.eventReconnectAttempt = 0;
+      this.touchHeartbeat();
+      this.startHeartbeatCheck(controller);
       
       // 异步处理事件流
       (async () => {
@@ -568,6 +582,7 @@ class OpencodeClientWrapper extends EventEmitter {
             this.scheduleEventReconnect('事件流中断');
           }
         } finally {
+          this.clearHeartbeatCheckTimer();
           if (this.eventAbortController === controller) {
             this.eventAbortController = null;
           }
@@ -583,8 +598,122 @@ class OpencodeClientWrapper extends EventEmitter {
     }
   }
 
+  private touchHeartbeat(): void {
+    this.lastHeartbeatAt = Date.now();
+  }
+
+  private clearHeartbeatCheckTimer(): void {
+    if (this.heartbeatCheckTimer) {
+      clearInterval(this.heartbeatCheckTimer);
+      this.heartbeatCheckTimer = null;
+    }
+  }
+
+  private startHeartbeatCheck(controller: AbortController): void {
+    this.clearHeartbeatCheckTimer();
+    const timeoutMs = opencodeConfig.eventHeartbeatTimeoutMs;
+    if (timeoutMs <= 0) return;
+
+    this.heartbeatCheckTimer = setInterval(() => {
+      if (!this.eventStreamActive || !this.eventListeningEnabled || controller.signal.aborted) return;
+      const elapsed = Date.now() - this.lastHeartbeatAt;
+      if (elapsed >= timeoutMs) {
+        console.warn(`[OpenCode] 事件流心跳超时 ${Math.round(elapsed / 1000)}s，主动断开重连`);
+        this.clearHeartbeatCheckTimer();
+        controller.abort();
+        this.eventStreamActive = false;
+        if (this.eventAbortController === controller) {
+          this.eventAbortController = null;
+        }
+        this.scheduleEventReconnect('心跳超时');
+      }
+    }, 15000);
+  }
+
+  getConnectionStatus(): { connected: boolean; lastHeartbeatAt: number } {
+    return {
+      connected: this.client !== null && this.eventStreamActive,
+      lastHeartbeatAt: this.lastHeartbeatAt,
+    };
+  }
+
   // 处理SSE事件
   private handleEvent(event: { type: string; properties?: Record<string, unknown> }): void {
+    this.touchHeartbeat();
+
+    const props = event.properties || {};
+    const part = props.part as Record<string, unknown> | undefined;
+    const sessionId = getFirstString(
+      props.sessionID as string,
+      props.sessionId as string,
+      props.session_id as string,
+      part?.sessionID as string,
+      part?.sessionId as string,
+    ) || '';
+    const messageId = getFirstString(
+      props.messageID as string,
+      props.messageId as string,
+      props.message_id as string,
+      part?.messageID as string,
+      part?.messageId as string,
+    ) || '';
+    // dedup 策略：
+    //   message.part.delta  — 按 partID+field+delta内容 去重，5ms 窗口
+    //                         两路流 echo 间隔通常 <5ms；5ms 可过滤 echo 且不误杀合法重复字符（如 "hello" 中的 "ll"）
+    //   message.part.updated — 按 partID 去重（同一 part 两路流快照；使用更稳定的 key 避免重复）
+    //   其他事件             — 按 type:sessionId:messageId 去重，per-entry TTL
+    const partId = getFirstString(
+      part?.id as string,
+      props.partId as string,
+      props.partID as string,
+    );
+    const now = Date.now();
+    if (event.type === 'message.part.delta') {
+      const field = (props.field as string) || '';
+      const delta = (props.delta as string) || '';
+      // 仅过滤两路流 echo（间隔通常 <5ms），避免误杀合法重复字符（如 "hello" 中的两个 "l"）
+      const deltaKey = `${partId}:${field}:${delta}`;
+      const lastSeen = this.recentDeltaKeys.get(deltaKey);
+      if (lastSeen !== undefined && now - lastSeen < 5) {
+        return;
+      }
+      this.recentDeltaKeys.set(deltaKey, now);
+    } else {
+      let dedupKey: string;
+      if (event.type === 'message.part.updated') {
+        // 修复：使用更稳定的去重 key，不包含 partStatus
+        // 原因：partStatus 可能为空或变化，导致去重失效
+        // 使用 sessionId:messageId:partId 作为唯一标识，120s 窗口
+        dedupKey = `message.part.updated:${sessionId}:${messageId}:${partId}`;
+      } else if (event.type === 'session.status') {
+        // session.status 必须把状态类型纳入 key，否则 idle 会被 running 去重掉
+        const statusType = (event.properties as Record<string, unknown>)?.status
+          ? ((event.properties as Record<string, unknown>).status as Record<string, unknown>)?.type
+          : undefined;
+        dedupKey = `session.status:${sessionId}:${String(statusType ?? '')}`;
+      } else {
+        dedupKey = `${event.type}:${sessionId}:${messageId}`;
+      }
+      const dedupTtlMs = event.type === 'message.part.updated' ? 120000 : 60000; // message.part.updated 使用 120s 窗口
+      const lastSeen = this.recentEventKeys.get(dedupKey);
+      if (lastSeen !== undefined && now - lastSeen < dedupTtlMs) {
+        console.log(`[OpenCode] 事件去重跳过: type=${event.type}, key=${dedupKey.slice(0, 80)}...`);
+        return;
+      }
+      this.recentEventKeys.set(dedupKey, now);
+    }
+    if (!this.eventDedupCleanupTimer) {
+      const dedupWindowMs = Math.max(opencodeConfig.eventHeartbeatTimeoutMs * 2, 30000);
+      this.eventDedupCleanupTimer = setInterval(() => {
+        const cutoff = Date.now() - dedupWindowMs;
+        for (const [k, t] of this.recentEventKeys) {
+          if (t < cutoff) this.recentEventKeys.delete(k);
+        }
+        for (const [k, t] of this.recentDeltaKeys) {
+          if (t < cutoff) this.recentDeltaKeys.delete(k);
+        }
+      }, dedupWindowMs / 2);
+    }
     const eventType = event.type.toLowerCase();
     // 权限请求事件（兼容不同事件命名）
     if (isPermissionRequestEventType(eventType) && event.properties) {
@@ -633,6 +762,11 @@ class OpencodeClientWrapper extends EventEmitter {
       this.emit('messageUpdated', event.properties);
     }
 
+    // 会话更新事件（含 compaction 时间戳）
+    if (event.type === 'session.updated' && event.properties) {
+      this.emit('sessionUpdated', event.properties);
+    }
+
     // 会话状态变化事件
     if (event.type === 'session.status' && event.properties) {
       this.emit('sessionStatus', event.properties);
@@ -651,6 +785,22 @@ class OpencodeClientWrapper extends EventEmitter {
     // 消息部分更新事件（流式输出）
     if (event.type === 'message.part.updated' && event.properties) {
       this.emit('messagePartUpdated', event.properties);
+    }
+
+    // 流式 delta 事件（增量文本，需与 part.updated 统一处理）
+    if (event.type === 'message.part.delta' && event.properties) {
+      const props = event.properties as Record<string, unknown>;
+      const part = props.part as Record<string, unknown> | undefined;
+      const payload: Record<string, unknown> = { ...props };
+      if (!payload.part && sessionId && messageId) {
+        payload.part = {
+          sessionID: sessionId,
+          messageID: messageId,
+          type: (part as { type?: string })?.type || 'text',
+          id: props.partID || props.partId || props.part_id || (part as { id?: string })?.id,
+        };
+      }
+      this.emit('messagePartUpdated', payload);
     }
 
     // AI 提问事件
@@ -877,8 +1027,9 @@ class OpencodeClientWrapper extends EventEmitter {
     this.getClient();
     const model = this.resolveModelOption(options);
 
+    // 发送前确保已订阅目录事件流，避免漏收 OpenCode 的流式输出
     if (options?.directory) {
-      void this.ensureDirectoryEventStream(options.directory);
+      await this.ensureDirectoryEventStream(options.directory);
     }
 
     const dirQuery = options?.directory ? `?directory=${encodeURIComponent(options.directory)}` : '';
@@ -906,7 +1057,7 @@ class OpencodeClientWrapper extends EventEmitter {
     sessionId: string,
     command: string,
     args: string,
-    options?: { directory?: string }
+    options?: { directory?: string; providerId?: string; modelId?: string }
   ): Promise<{ info: Message; parts: Part[] }> {
     const client = this.getClient();
 
@@ -914,12 +1065,22 @@ class OpencodeClientWrapper extends EventEmitter {
       void this.ensureDirectoryEventStream(options.directory);
     }
 
+    // session.command API 的 model 字段是字符串格式（如 "providerID/modelID"），
+    // 不是 { providerID, modelID } 对象（那是 session.shell 的格式）
+    const model =
+      options?.providerId && options?.modelId
+        ? `${options.providerId}/${options.modelId}`
+        : undefined;
+
+    const body: Record<string, unknown> = {
+      command,
+      arguments: args,
+      ...(model ? { model } : {}),
+    };
+
       const result = await client.session.command({
         path: { id: sessionId },
-        body: {
-          command,
-          arguments: args,
-        },
+        body: body as never,
       ...(options?.directory ? { query: { directory: options.directory } } : {}),
       });
 
@@ -1380,7 +1541,9 @@ class OpencodeClientWrapper extends EventEmitter {
     for (const item of rawAgents) {
       if (!item || typeof item !== 'object') continue;
       const record = item as Record<string, unknown>;
-      const name = typeof record.name === 'string' ? record.name.trim() : '';
+      const name = typeof record.name === 'string'
+        ? record.name.replace(/[\u200b\u200c\u200d\ufeff]/g, '').trim()
+        : '';
       if (!name) continue;
 
       const description = typeof record.description === 'string' && record.description.trim().length > 0
@@ -1467,6 +1630,11 @@ class OpencodeClientWrapper extends EventEmitter {
     this.eventListeningEnabled = false;
     this.eventStreamActive = false;
     this.clearEventReconnectTimer();
+    this.clearHeartbeatCheckTimer();
+    if (this.eventDedupCleanupTimer) {
+      clearInterval(this.eventDedupCleanupTimer);
+      this.eventDedupCleanupTimer = null;
+    }
     this.eventReconnectAttempt = 0;
     if (this.eventAbortController) {
       this.eventAbortController.abort();

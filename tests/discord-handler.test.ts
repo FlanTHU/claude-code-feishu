@@ -1,4 +1,17 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
+
+// 确保群聊消息不被 @ 要求跳过，使权限/问题/普通消息测试能正常执行
+vi.mock('../src/config.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/config.js')>();
+  return {
+    ...actual,
+    groupConfig: {
+      ...actual.groupConfig,
+      requireMentionInGroup: false,
+    },
+  };
+});
+
 import { createDiscordHandler } from '../src/handlers/discord.js';
 import { permissionHandler } from '../src/permissions/handler.js';
 import { opencodeClient } from '../src/opencode/client.js';
@@ -133,6 +146,8 @@ describe('DiscordHandler permission text flow', () => {
 
   it('命令 ///compact 或 ///compat 应触发上下文压缩', async () => {
     chatSessionStore.setSessionByConversation('discord', 'conv-1', 'session-compact-1', 'user-1');
+    // 显式指定模型，避免测试环境 DEFAULT_PROVIDER/MODEL 或持久化数据覆盖 resolveCompactModel
+    chatSessionStore.updateConfigByConversation('discord', 'conv-1', { preferredModel: 'openai:gpt-5' });
     const sender = makeSender();
     const handler = createDiscordHandler(sender);
     vi.spyOn(opencodeClient, 'getProviders').mockResolvedValue({

@@ -21,7 +21,8 @@ export type CommandType =
   | 'command'      // 透传命令
   | 'permission'   // 权限响应
   | 'send'         // 发送文件到飞书
-  | 'rename';      // 重命名当前会话
+  | 'rename'       // 重命名当前会话
+  | 'cleanup';     // 清理历史 sessions
 
 // 解析后的命令
 export interface ParsedCommand {
@@ -41,6 +42,8 @@ export interface ParsedCommand {
   clearScope?: 'all' | 'free_session'; // 清理范围
   clearSessionId?: string;
   permissionResponse?: 'y' | 'n' | 'yes' | 'no';
+  permissionAllow?: boolean;    // 权限响应:是否允许
+  permissionRemember?: boolean; // 权限响应:是否记住(始终允许)
   commandName?: string;    // 透传命令名称
   commandArgs?: string;    // 透传命令参数
   commandPrefix?: '/' | '!'; // 透传命令前缀
@@ -67,6 +70,39 @@ const BANG_SHELL_ALLOWED_COMMANDS = new Set([
 const BANG_SHELL_BLOCKED_COMMANDS = new Set([
   'vi', 'vim', 'nvim', 'nano',
 ]);
+
+/**
+ * 解析权限确认回复。返回 null 表示不是权限回复。
+ * 与 index.ts 的 parsePermissionDecision 保持一致(支持 y/n/always 及中文)。
+ */
+export function parsePermissionReply(raw: string): { allow: boolean; remember: boolean } | null {
+  const normalized = raw.normalize('NFKC').trim().toLowerCase();
+  if (!normalized) return null;
+
+  const compact = normalized
+    .replace(/[\s　]+/g, '')
+    .replace(/[。！!,.，；;:：\-]/g, '');
+
+  const contains = (words: string[]): boolean =>
+    words.some(w => compact === w || compact.includes(w));
+
+  const isDeny =
+    compact === 'n' || compact === 'no' || compact === '否' ||
+    contains(['拒绝', '不同意', '不允许', 'deny']);
+  if (isDeny) return { allow: false, remember: false };
+
+  const hasAlways =
+    compact.includes('始终') || compact.includes('永久') ||
+    compact.includes('always') || compact.includes('记住') || compact.includes('总是');
+
+  const isAllow =
+    compact === 'y' || compact === 'yes' || compact === 'ok' ||
+    compact === 'always' || compact === '允许' || compact === '始终允许' ||
+    contains(['允许', '同意', '通过', '批准', 'allow']);
+  if (isAllow) return { allow: true, remember: hasAlways };
+
+  return null;
+}
 
 // 命令解析器
 function isSlashCommandToken(token: string): boolean {
@@ -155,12 +191,15 @@ export function parseCommand(text: string): ParsedCommand {
     };
   }
 
-  // 权限响应（单独处理y/n）
-  if (lower === 'y' || lower === 'yes') {
-    return { type: 'permission', permissionResponse: 'y' };
-  }
-  if (lower === 'n' || lower === 'no') {
-    return { type: 'permission', permissionResponse: 'n' };
+  // 权限响应（y/n/always 及中文等价词；与 index.ts parsePermissionDecision 对齐）
+  const permDecision = parsePermissionReply(lower);
+  if (permDecision) {
+    return {
+      type: 'permission',
+      permissionResponse: permDecision.allow ? 'y' : 'n',
+      permissionAllow: permDecision.allow,
+      permissionRemember: permDecision.remember,
+    };
   }
 
   // 斜杠命令
@@ -361,6 +400,11 @@ export function parseCommand(text: string): ParsedCommand {
         };
       }
 
+      case 'cleanup':
+      case 'cleanup-sessions':
+      case 'clean':
+        return { type: 'cleanup' };
+
       default:
         // 未知命令透传到OpenCode
         return {
@@ -416,13 +460,15 @@ export function getHelpText(): string {
 • \`/create_chat\` 或 \`/建群\` 私聊中调出建群卡片（新建或绑定已有会话）
 • \`/project list\` 列出可用项目；\`/project default\` 查看/设置/清除群默认项目
 • \`/clear\` 等价 \`/session new\`；\`/clear free session\` 清理空闲群聊
+• \`/cleanup\` 清理历史 sessions（删除 subagent/tiny sessions，归档旧会话）
 • \`/status\` 查看当前绑定状态和群聊生命周期信息
 
 💡 **提示**
 • 切换的模型/角色仅对**当前会话**生效。
 • 强度优先级：\`#临时覆盖\` > \`/effort 会话默认\` > OpenCode 默认。
-• 其他未知 \`/xxx\` 命令会自动透传给 OpenCode（会话已绑定时生效）。
+• 其他未知 \`/xxx\` 命令会自动透传给 OpenCode（会话已绑定时生效）；透传 \`/cmd\` 与 \`!shell\` 会尽量使用**当前会话在面板选择的模型**（若 OpenCode 服务端支持该字段）。
 • 支持透传白名单 shell 命令：\`!cd\`、\`!ls\`、\`!mkdir\`、\`!rm\`、\`!cp\`、\`!mv\`、\`!git\` 等；\`!vi\` / \`!vim\` / \`!nano\` 不会透传。
+• 面板底部「最近」模型为本地记录，便于快速切回常用模型。
 • 如果遇到问题，试着使用 \`/panel\` 面板操作更方便。
 
 📤 **文件发送**

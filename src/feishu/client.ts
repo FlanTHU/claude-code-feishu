@@ -2,6 +2,51 @@ import * as lark from '@larksuiteoapi/node-sdk';
 import { feishuConfig } from '../config.js';
 import { EventEmitter } from 'events';
 import type { ReadStream } from 'fs';
+import { readFileSync, writeFileSync, mkdirSync } from 'fs';
+import { join, dirname } from 'path';
+import { fileURLToPath } from 'url';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+const PROCESSED_IDS_PATH = join(__dirname, '../../logs/processed-message-ids.json');
+const PROCESSED_ID_TTL_MS = 24 * 60 * 60 * 1000; // 24 小时
+const SAVE_DEBOUNCE_MS = 500;
+
+function loadProcessedIds(): Map<string, number> {
+  try {
+    const raw = readFileSync(PROCESSED_IDS_PATH, 'utf-8');
+    const parsed = JSON.parse(raw) as unknown;
+    const now = Date.now();
+    const map = new Map<string, number>();
+    if (Array.isArray(parsed)) {
+      for (const entry of parsed) {
+        if (Array.isArray(entry) && typeof entry[0] === 'string' && typeof entry[1] === 'number') {
+          if (now - entry[1] < PROCESSED_ID_TTL_MS) {
+            map.set(entry[0], entry[1]);
+          }
+        } else if (typeof entry === 'string') {
+          map.set(entry, now);
+        }
+      }
+    }
+    return map;
+  } catch {
+    return new Map();
+  }
+}
+
+let saveDebounceTimer: ReturnType<typeof setTimeout> | null = null;
+
+function saveProcessedIds(ids: Map<string, number>): void {
+  if (saveDebounceTimer) return;
+  saveDebounceTimer = setTimeout(() => {
+    saveDebounceTimer = null;
+    try {
+      mkdirSync(dirname(PROCESSED_IDS_PATH), { recursive: true });
+      writeFileSync(PROCESSED_IDS_PATH, JSON.stringify(Array.from(ids.entries())));
+    } catch (_) { void 0; }
+  }, SAVE_DEBOUNCE_MS);
+}
 
 function formatError(error: unknown): { message: string; responseData?: unknown } {
   if (error instanceof Error) {
@@ -148,6 +193,7 @@ export interface FeishuMessageEvent {
   messageId: string;
   chatId: string;
   threadId?: string;
+  parentId?: string;
   chatType: 'p2p' | 'group';
   senderId: string;
   senderType: 'user' | 'bot';
@@ -197,6 +243,7 @@ function collectAttachmentsFromContent(content: unknown): FeishuAttachment[] {
     }
 
     const record = current as Record<string, unknown>;
+
     const imageKey = getString(record.image_key) || getString(record.imageKey);
     if (imageKey) {
       attachments.push({ type: 'image', fileKey: imageKey });
@@ -221,9 +268,42 @@ function collectAttachmentsFromContent(content: unknown): FeishuAttachment[] {
   return attachments;
 }
 
+function extractTextFromInteractive(content: unknown): string {
+  if (!content || typeof content !== 'object') return '';
+  const parts: string[] = [];
+  const stack: unknown[] = [content];
+  const visited = new Set<object>();
+  while (stack.length > 0) {
+    const current = stack.pop();
+    if (!current || typeof current !== 'object') continue;
+    if (visited.has(current as object)) continue;
+    visited.add(current as object);
+    if (Array.isArray(current)) {
+      for (const item of current) stack.push(item);
+      continue;
+    }
+    const node = current as Record<string, unknown>;
+    if (typeof node.text === 'string' && node.text.trim()) {
+      parts.push(node.text.trim());
+    }
+    if (typeof node.content === 'string' && node.content.trim()) {
+      parts.push(node.content.trim());
+    }
+    for (const value of Object.values(node)) {
+      if (value && typeof value === 'object') stack.push(value);
+    }
+  }
+  return parts.join(' ');
+}
+
 function extractTextFromPost(content: unknown): string {
   if (!content || typeof content !== 'object') return '';
-  const record = content as { content?: unknown; title?: unknown };
+
+  const outer = content as Record<string, unknown>;
+  const langContent = outer.zh_cn ?? outer.en_us ?? outer.ja_jp;
+  const resolved = langContent ?? content;
+
+  const record = resolved as { content?: unknown; title?: unknown };
   const parts: string[] = [];
   const root = record.content;
   if (!root) return '';
@@ -252,7 +332,7 @@ function extractTextFromPost(content: unknown): string {
     }
   }
 
-  return parts.join('');
+  return parts.join(' ');
 }
 
 // 卡片动作事件类型
@@ -277,6 +357,12 @@ class FeishuClient extends EventEmitter {
   private eventDispatcher: lark.EventDispatcher;
   private cardActionHandler?: (event: FeishuCardActionEvent) => Promise<FeishuCardActionResponse | void>;
   private cardUpdateQueue: Map<string, Promise<boolean>> = new Map();
+  private lastMessageAt = 0;
+  private wsIdleCheckTimer: ReturnType<typeof setInterval> | null = null;
+  private wsStopped = false;
+  private wsReconnectAttempt = 0;
+  private processedMessageIds: Map<string, number> = loadProcessedIds();
+  private readonly startedAt: number = Date.now();
 
   constructor() {
     super();
@@ -293,18 +379,56 @@ class FeishuClient extends EventEmitter {
     });
   }
 
+  private touchLastMessage(): void {
+    this.lastMessageAt = Date.now();
+  }
+
+  private async doConnectWs(): Promise<void> {
+    this.wsClient = new lark.WSClient({
+      appId: feishuConfig.appId,
+      appSecret: feishuConfig.appSecret,
+    });
+    await this.wsClient.start({ eventDispatcher: this.eventDispatcher });
+    this.touchLastMessage();
+    this.wsReconnectAttempt = 0;
+  }
+
+  private startIdleCheck(): void {
+    this.stopIdleCheck();
+  }
+
+  private stopIdleCheck(): void {
+    if (this.wsIdleCheckTimer) {
+      clearInterval(this.wsIdleCheckTimer);
+      this.wsIdleCheckTimer = null;
+    }
+  }
+
+  private async reconnectWs(_reason: string): Promise<void> {
+    return;
+  }
+
+  getConnectionStatus(): { connected: boolean; lastMessageAt: number } {
+    return {
+      connected: this.wsClient !== null && !this.wsStopped,
+      lastMessageAt: this.lastMessageAt,
+    };
+  }
+
   // 启动长连接
   async start(): Promise<void> {
     console.log('[飞书] 正在启动长连接...');
+    this.wsStopped = false;
 
     // 注册消息接收事件
     this.eventDispatcher.register({
       'im.message.receive_v1': (data) => {
+        this.touchLastMessage();
         this.handleMessage(data as FeishuEventData);
         return { msg: 'ok' };
       },
-      // 注册消息已读事件（消除警告）
       'im.message.message_read_v1': (data) => {
+        this.touchLastMessage();
         return { msg: 'ok' };
       },
     });
@@ -312,57 +436,55 @@ class FeishuClient extends EventEmitter {
     // 注册卡片回调事件
     this.eventDispatcher.register({
       'card.action.trigger': async (data: unknown) => {
+        this.touchLastMessage();
         return await this.handleCardAction(data);
       },
     } as unknown as Record<string, (data: unknown) => Promise<FeishuCardActionResponse | { msg: string }>>);
 
-    // 监听消息撤回事件
-    // 本地不再重复注册撤回事件，避免与 onMessageRecalled 冲突
-    this.wsClient = new lark.WSClient({
-      appId: feishuConfig.appId,
-      appSecret: feishuConfig.appSecret,
-    });
-
-    // 启动连接
-    await this.wsClient.start({ eventDispatcher: this.eventDispatcher });
+    await this.doConnectWs();
+    this.startIdleCheck();
     console.log('[飞书] 长连接已建立');
   }
 
   // 监听群成员退群事件
   onMemberLeft(callback: (chatId: string, memberId: string) => void): void {
-    // @ts-ignore: using loose types for dynamic registration
-    this.eventDispatcher.register({
-      'im.chat.member.user.deleted_v1': (data: any) => {
-         const chatId = data.chat_id;
-         const users = data.users || [];
-         for (const user of users) {
-           const openId = user.user_id?.open_id;
-           if (openId) callback(chatId, openId);
-         }
-         return { msg: 'ok' };
-      }
+    type MemberLeftData = {
+      chat_id?: string;
+      users?: Array<{ user_id?: { open_id?: string } }>;
+    };
+    (this.eventDispatcher.register as (handlers: Record<string, (data: unknown) => { msg: string }>) => void)({
+      'im.chat.member.user.deleted_v1': (data: unknown) => {
+        const event = data as MemberLeftData;
+        const chatId = event.chat_id;
+        const users = event.users || [];
+        for (const user of users) {
+          const openId = user.user_id?.open_id;
+          if (chatId && openId) callback(chatId, openId);
+        }
+        return { msg: 'ok' };
+      },
     });
   }
 
   // 监听群解散事件
   onChatDisbanded(callback: (chatId: string) => void): void {
-     // @ts-ignore
-     this.eventDispatcher.register({
-      'im.chat.disbanded_v1': (data: any) => {
-         if (data.chat_id) callback(data.chat_id);
-         return { msg: 'ok' };
-      }
+    type ChatDisbandedData = { chat_id?: string };
+    (this.eventDispatcher.register as (handlers: Record<string, (data: unknown) => { msg: string }>) => void)({
+      'im.chat.disbanded_v1': (data: unknown) => {
+        const event = data as ChatDisbandedData;
+        if (event.chat_id) callback(event.chat_id);
+        return { msg: 'ok' };
+      },
     });
   }
 
   // 监听消息撤回事件
-  onMessageRecalled(callback: (event: any) => void): void {
-     // @ts-ignore
-     this.eventDispatcher.register({
-      'im.message.recalled_v1': (data: any) => {
-         callback(data);
-         return { msg: 'ok' };
-      }
+  onMessageRecalled(callback: (event: { chat_id?: string; message_id?: string; [key: string]: unknown }) => void): void {
+    (this.eventDispatcher.register as (handlers: Record<string, (data: unknown) => { msg: string }>) => void)({
+      'im.message.recalled_v1': (data: unknown) => {
+        callback(data as Record<string, unknown>);
+        return { msg: 'ok' };
+      },
     });
   }
 
@@ -372,26 +494,63 @@ class FeishuClient extends EventEmitter {
       const message = data.message;
       const sender = data.sender;
 
-      // 忽略机器人自己发的消息
+      const msgId = message.message_id;
+      if (msgId) {
+        if (this.processedMessageIds.has(msgId)) {
+          console.log(`[飞书] 消息去重跳过: msgId=${msgId}`);
+          return;
+        }
+        const now = Date.now();
+        this.processedMessageIds.set(msgId, now);
+        for (const [id, ts] of this.processedMessageIds) {
+          if (now - ts > PROCESSED_ID_TTL_MS) {
+            this.processedMessageIds.delete(id);
+          }
+        }
+        saveProcessedIds(this.processedMessageIds);
+      }
+
+      const msgCreateTimeMs = message.create_time ? Number(message.create_time) : 0;
+      const msgAgeMs = msgCreateTimeMs > 0 ? this.startedAt - msgCreateTimeMs : 0;
+      if (msgCreateTimeMs > 0 && msgAgeMs > 30000) {
+        console.log(`[飞书] 跳过历史消息(启动前 ${Math.round(msgAgeMs / 1000)}s): msgId=${msgId}`);
+        return;
+      }
+
       if (sender.sender_type === 'bot') {
         return;
       }
 
       const msgType = message.message_type;
+      const rawContent = message?.content;
+
+      // [DEBUG] 打印原始消息格式，用于排查图片传输问题
+      console.log(`[飞书-DEBUG] 收到消息: msgType=${msgType}, chatId=${message.chat_id}, content=${typeof rawContent === 'string' ? rawContent.slice(0, 200) : 'null'}`);
+
       let content = '';
       let parsedContent: Record<string, unknown> | null = null;
-      try {
-        parsedContent = JSON.parse(message.content) as Record<string, unknown>;
-        if (parsedContent && typeof parsedContent.text === 'string') {
-          content = parsedContent.text;
+      if (typeof rawContent !== 'string' || !rawContent.trim()) {
+        content = typeof rawContent === 'string' ? rawContent : '';
+      } else {
+        try {
+          parsedContent = JSON.parse(rawContent) as Record<string, unknown>;
+          if (parsedContent && typeof parsedContent.text === 'string') {
+            content = parsedContent.text;
+          }
+        } catch {
+          content = rawContent;
         }
-      } catch {
-        content = message.content;
       }
 
       if (!content && parsedContent && msgType === 'post') {
         const postText = extractTextFromPost(parsedContent);
         if (postText) content = postText;
+      }
+
+      // interactive（卡片）消息：递归提取所有 text 字段，供关键词触发检测
+      if (!content && parsedContent && msgType === 'interactive') {
+        const cardText = extractTextFromInteractive(parsedContent);
+        if (cardText) content = cardText;
       }
 
       const attachments: FeishuAttachment[] = [];
@@ -441,6 +600,13 @@ class FeishuClient extends EventEmitter {
 
       attachments.push(...attachmentMap.values());
 
+      // [DEBUG] 打印解析出的附件信息
+      if (attachments.length > 0) {
+        console.log(`[飞书-DEBUG] 解析到附件: ${JSON.stringify(attachments)}`);
+      } else {
+        console.log(`[飞书-DEBUG] 无附件, msgType=${msgType}`);
+      }
+
       // 移除@机器人的部分
       if (message.mentions) {
         for (const mention of message.mentions) {
@@ -452,6 +618,7 @@ class FeishuClient extends EventEmitter {
         messageId: message.message_id,
         chatId: message.chat_id,
         threadId: message.thread_id,
+        parentId: message.parent_id,
         chatType: message.chat_type as 'p2p' | 'group',
         senderId: sender.sender_id?.open_id || '',
         senderType: sender.sender_type as 'user' | 'bot',
@@ -584,8 +751,7 @@ class FeishuClient extends EventEmitter {
       }
       return msgId;
     } catch (error) {
-      const formatted = formatError(error);
-      const errCode = typeof error === 'object' && error !== null && 'code' in error ? (error as { code?: number }).code : undefined;
+      const formatted = formatError(error);      const errCode = typeof error === 'object' && error !== null && 'code' in error ? (error as { code?: number }).code : undefined;
       const apiCode = extractApiCode(formatted.responseData);
       if (apiCode === 230002) {
         console.warn(`[飞书] 群不可用，发送文字失败: chatId=${chatId}`);
@@ -593,6 +759,32 @@ class FeishuClient extends EventEmitter {
         return null;
       }
       console.error(`[飞书] 发送文字失败: code=${errCode}, ${formatted.message}`);
+      return null;
+    }
+  }
+
+  async sendMentionText(chatId: string, mentions: Array<{ openId: string; name: string }>, text: string): Promise<string | null> {
+    const atTags = mentions.map(m => `<at user_id="${m.openId}">${m.name}</at>`).join(' ');
+    const fullText = atTags ? `${atTags} ${text}` : text;
+    return this.sendText(chatId, fullText);
+  }
+
+  async sendTextToOpenId(openId: string, text: string): Promise<string | null> {
+    try {
+      const response = await this.client.im.message.create({
+        params: { receive_id_type: 'open_id' },
+        data: {
+          receive_id: openId,
+          msg_type: 'text',
+          content: JSON.stringify({ text }),
+        },
+      });
+      const msgId = response.data?.message_id || null;
+      if (msgId) console.log(`[飞书] 发送私信成功: msgId=${msgId.slice(0, 16)}...`);
+      return msgId;
+    } catch (error) {
+      const formatted = formatError(error);
+      console.error(`[飞书] 发送私信失败: ${formatted.message}`);
       return null;
     }
   }
@@ -667,7 +859,7 @@ class FeishuClient extends EventEmitter {
     return await next;
   }
 
-  private async doUpdateCard(messageId: string, card: object): Promise<boolean> {
+  private async doUpdateCard(messageId: string, card: object, retryOnRateLimit = true): Promise<boolean> {
     try {
       const data = {
         msg_type: 'interactive',
@@ -681,6 +873,14 @@ class FeishuClient extends EventEmitter {
       return true;
     } catch (error) {
       const formatted = formatError(error);
+      const apiCode = extractApiCode(formatted.responseData);
+
+      if (apiCode === 230020 && retryOnRateLimit) {
+        console.warn(`[飞书] 更新卡片触发限频(230020)，3s 后重试: msgId=${messageId.slice(0, 16)}...`);
+        await new Promise(resolve => setTimeout(resolve, 3000));
+        return this.doUpdateCard(messageId, card, false);
+      }
+
       const errCode = typeof error === 'object' && error !== null && 'code' in error ? (error as { code?: number }).code : undefined;
       const errMsg = typeof error === 'object' && error !== null && 'msg' in error ? (error as { msg?: string }).msg : undefined;
       console.error(`[飞书] 更新卡片失败: code=${errCode}, msg=${errMsg}, msgId=${messageId}`);
@@ -762,8 +962,9 @@ class FeishuClient extends EventEmitter {
       }
 
       if (isUniversalCardBuildFailure(formatted.responseData)) {
-        console.warn(`[飞书] 发送卡片触发 230099/200800，尝试发送精简卡片: chatId=${chatId}`);
+        console.warn(`[飞书] 发送卡片触发 230099/200800，尝试占位卡片+patch 方案: chatId=${chatId}`);
         try {
+          // Step 1: 先发占位精简卡片（create 接口只支持简单卡片）
           const fallbackResponse = await this.client.im.message.create({
             params: { receive_id_type: 'chat_id' },
             data: {
@@ -774,13 +975,23 @@ class FeishuClient extends EventEmitter {
           });
 
           const fallbackMsgId = fallbackResponse.data?.message_id || null;
-          if (fallbackMsgId) {
-            console.log(`[飞书] 精简卡片发送成功: msgId=${fallbackMsgId.slice(0, 16)}...`);
+          if (!fallbackMsgId) {
+            console.warn('[飞书] 占位卡片发送返回空消息ID');
+            return null;
+          }
+          console.log(`[飞书] 占位卡片发送成功: msgId=${fallbackMsgId.slice(0, 16)}...`);
+
+          // Step 2: patch 真实卡片内容（patch 接口支持完整 schema 2.0 卡片）
+          const patchSuccess = await this.doUpdateCard(fallbackMsgId, card);
+          if (patchSuccess) {
+            console.log(`[飞书] 真实卡片 patch 成功: msgId=${fallbackMsgId.slice(0, 16)}...`);
+          } else {
+            console.warn(`[飞书] 真实卡片 patch 失败，保留占位卡片: msgId=${fallbackMsgId.slice(0, 16)}...`);
           }
           return fallbackMsgId;
         } catch (fallbackError) {
           const fallbackFormatted = formatError(fallbackError);
-          console.error(`[飞书] 精简卡片发送失败: ${fallbackFormatted.message}`);
+          console.error(`[飞书] 占位卡片发送失败: ${fallbackFormatted.message}`);
         }
       }
 
@@ -909,6 +1120,9 @@ class FeishuClient extends EventEmitter {
   }
 
   // 获取机器人所在的群列表
+  // 注意：tenant_access_token 只能获取 Bot 主动加入的群，被拉进去的群不在列表中。
+  // 使用场景：仅用于获取"bot 主动加入的群"，不能用于验证 bot 是否在某个具体群里。
+  // 如需验证 bot 是否在群里，请使用 isBotInChat()。
   async getUserChats(): Promise<string[]> {
     try {
       const chatIds: string[] = [];
@@ -937,6 +1151,73 @@ class FeishuClient extends EventEmitter {
       const formatted = formatError(error);
       console.error('[飞书] 获取群列表失败:', formatted.message, formatted.responseData ?? '');
       return [];
+    }
+  }
+
+  async listRecentImageFromUser(
+    chatId: string,
+    senderId: string,
+    beforeMessageId: string,
+    lookbackSeconds: number = 300
+  ): Promise<Array<{ messageId: string; fileKey: string }> | null> {
+    try {
+      const now = Math.floor(Date.now() / 1000);
+      const startTime = String(now - lookbackSeconds);
+      const results: Array<{ messageId: string; fileKey: string }> = [];
+
+      let pageToken: string | undefined;
+      do {
+        const response = await this.client.im.message.list({
+          params: {
+            container_id_type: 'chat',
+            container_id: chatId,
+            start_time: startTime,
+            end_time: String(now),
+            sort_type: 'ByCreateTimeDesc',
+            page_size: 20,
+            page_token: pageToken,
+          },
+        });
+
+        const items = response.data?.items ?? [];
+        for (const item of items) {
+          if (item.message_id === beforeMessageId) continue;
+          if (item.sender?.id !== senderId) continue;
+          if (item.msg_type !== 'image') continue;
+
+          let fileKey: string | undefined;
+          try {
+            const content = JSON.parse(item.body?.content ?? '{}');
+            fileKey = content.image_key;
+          } catch { /* ignore parse errors */ }
+
+          if (fileKey) {
+            results.push({ messageId: item.message_id!, fileKey });
+          }
+        }
+
+        pageToken = response.data?.page_token;
+      } while (pageToken && results.length === 0);
+
+      return results.length > 0 ? results : null;
+    } catch (error) {
+      const formatted = formatError(error);
+      console.error('[飞书] 查询最近图片失败:', formatted.message, formatted.responseData ?? '');
+      return null;
+    }
+  }
+
+  // 验证 Bot 是否在指定群里（无论主动加入还是被拉进去）
+  // 用 chat.get 直接查询群信息，成功则表示 bot 有权限访问该群
+  async isBotInChat(chatId: string): Promise<boolean | null> {
+    try {
+      const response = await this.client.im.chat.get({
+        path: { chat_id: chatId },
+        params: { user_id_type: 'open_id' },
+      });
+      return response.code === 0 && !!response.data;
+    } catch {
+      return null;
     }
   }
 
@@ -1103,10 +1384,51 @@ class FeishuClient extends EventEmitter {
     }
   }
 
+  // 添加消息表情回复（reaction）
+  async addReaction(messageId: string, emojiType: string): Promise<string | null> {
+    try {
+      const response = await this.client.im.messageReaction.create({
+        path: { message_id: messageId },
+        data: { reaction_type: { emoji_type: emojiType } },
+      });
+
+      const reactionId = response.data?.reaction_id || null;
+      if (reactionId) {
+        console.log(`[飞书] 添加 reaction 成功: msgId=${messageId.slice(0, 16)}..., emoji=${emojiType}`);
+      }
+      return reactionId;
+    } catch (error) {
+      const formatted = formatError(error);
+      console.warn(`[飞书] 添加 reaction 失败: ${formatted.message}`);
+      return null;
+    }
+  }
+
+  // 删除消息表情回复（reaction）
+  async removeReaction(messageId: string, reactionId: string): Promise<boolean> {
+    try {
+      await this.client.im.messageReaction.delete({
+        path: { message_id: messageId, reaction_id: reactionId },
+      });
+      console.log(`[飞书] 删除 reaction 成功: msgId=${messageId.slice(0, 16)}..., reactionId=${reactionId.slice(0, 16)}...`);
+      return true;
+    } catch (error) {
+      const formatted = formatError(error);
+      console.warn(`[飞书] 删除 reaction 失败: ${formatted.message}`);
+      return false;
+    }
+  }
+
   // 停止长连接
   stop(): void {
+    this.wsStopped = true;
+    this.stopIdleCheck();
     if (this.wsClient) {
-      this.wsClient.close();
+      try {
+        this.wsClient.close();
+      } catch {
+        // ignore
+      }
       this.wsClient = null;
     }
     console.log('[飞书] 已断开连接');

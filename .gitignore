@@ -7,6 +7,11 @@ dist/
 # 环境变量和敏感配置
 .env
 *.env.local
+feishu_uat.json
+*_uat.json
+
+# 运行时 PID 文件
+.bridge-pid
 
 # 日志文件
 logs/

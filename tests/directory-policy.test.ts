@@ -10,7 +10,11 @@ describe('DirectoryPolicy - Path Normalization and Security', () => {
   describe('normalizePath', () => {
     it('应该规范化相对路径为绝对路径', () => {
       const result = normalizePath('./test');
-      expect(result).toMatch(/^[A-Za-z]:\\/); // Windows 绝对路径
+      if (process.platform === 'win32') {
+        expect(result).toMatch(/^[A-Za-z]:\\/); // Windows 绝对路径
+      } else {
+        expect(result).toMatch(/^\//); // Unix 绝对路径
+      }
     });
 
     it('应该规范化包含 .. 的路径', () => {

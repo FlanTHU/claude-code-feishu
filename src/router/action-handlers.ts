@@ -10,7 +10,7 @@ import type { FeishuMessageEvent } from '../feishu/client.js';
 import type { CardActionResponse } from './root-router.js';
 import { chatSessionStore } from '../store/chat-session.js';
 import { permissionHandler } from '../permissions/handler.js';
-import { opencodeClient } from '../opencode/client.js';
+import { activeBackend } from '../backend/active.js';
 import { outputBuffer } from '../opencode/output-buffer.js';
 import { feishuClient } from '../feishu/client.js';
 import { groupHandler } from '../handlers/group.js';
@@ -168,7 +168,7 @@ export function createPermissionActionCallbacks(
       rememberRaw === '始终允许';
 
     const permissionDirectoryOptions = resolvePermissionDirectoryOptions(sessionId);
-    const responded = await opencodeClient.respondToPermission(
+    const responded = await activeBackend.respondToPermission(
       sessionId,
       permissionId,
       allow,
@@ -236,7 +236,7 @@ export function createPermissionActionCallbacks(
     }
 
     const permissionDirectoryOptions = resolvePermissionDirectoryOptions(pending.sessionId, event.chatId);
-    const responded = await opencodeClient.respondToPermission(
+    const responded = await activeBackend.respondToPermission(
       pending.sessionId,
       pending.permissionId,
       decision.allow,
@@ -255,10 +255,10 @@ export function createPermissionActionCallbacks(
     );
 
     const removed = permissionHandler.resolveForChat(event.chatId, pending.permissionId);
-    const bufferKey = `chat:${event.chatId}`;
-    if (!outputBuffer.get(bufferKey)) {
-      outputBuffer.getOrCreate(bufferKey, event.chatId, pending.sessionId, event.messageId);
-    }
+     const bufferKey = `chat:${event.chatId}`;
+     if (!outputBuffer.get(bufferKey)) {
+       outputBuffer.getOrCreate(bufferKey, event.chatId, pending.sessionId, event.messageId, 'action-handlers:cardPermissionReply');
+     }
 
     const toolName = removed?.tool || pending.tool || '工具';
     const resolvedText = decision.allow

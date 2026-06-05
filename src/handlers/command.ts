@@ -1,20 +1,23 @@
-import { type ParsedCommand, getHelpText } from '../commands/parser.js';
-import { KNOWN_EFFORT_LEVELS, normalizeEffortLevel, type EffortLevel } from '../commands/effort.js';
-import { feishuClient } from '../feishu/client.js';
-import * as path from 'path';
-import { buildSessionTimestamp } from '../utils/session-title.js';
+ import { type ParsedCommand, getHelpText } from '../commands/parser.js';
+ import { KNOWN_EFFORT_LEVELS, normalizeEffortLevel, type EffortLevel } from '../commands/effort.js';
+ import { feishuClient } from '../feishu/client.js';
+ import * as path from 'path';
+ import { buildSessionTimestamp } from '../utils/session-title.js';
+ import { outputBuffer } from '../opencode/output-buffer.js';
 import {
-  opencodeClient,
   type OpencodeAgentConfig,
   type OpencodeAgentInfo,
   type OpencodeRuntimeConfig,
 } from '../opencode/client.js';
-import { chatSessionStore } from '../store/chat-session.js';
+import { activeBackend, activeBackendId } from '../backend/active.js';
+import { chatSessionStore, normalizeAgentName } from '../store/chat-session.js';
 import { buildControlCard, buildStatusCard } from '../feishu/cards.js';
 import { modelConfig, userConfig } from '../config.js';
 import { sendFileToFeishu } from './file-sender.js';
 import { lifecycleHandler } from './lifecycle.js';
 import { DirectoryPolicy } from '../utils/directory-policy.js';
+import { parseProviderModelString } from '../utils/provider-model.js';
+import { isAgentVisibleInPanel } from '../constants/agent-visibility.js';
 
 const SUPPORTED_ROLE_TOOLS = [
   'bash',
@@ -62,7 +65,6 @@ const ROLE_TOOL_ALIAS: Record<string, RoleTool> = {
 };
 
 const ROLE_CREATE_USAGE = '用法: 创建角色 名称=旅行助手; 描述=擅长制定旅行计划; 类型=主; 工具=webfetch; 提示词=先给出预算再做路线';
-const INTERNAL_HIDDEN_AGENT_NAMES = new Set(['compaction', 'title', 'summary']);
 const PANEL_MODEL_OPTION_LIMIT = 500;
 const EFFORT_USAGE_TEXT = '用法: /effort（查看） 或 /effort <low|high|max|xhigh>（设置） 或 /effort default（清除）';
 const EFFORT_DISPLAY_ORDER = KNOWN_EFFORT_LEVELS;
@@ -283,29 +285,76 @@ function parseRoleCreateSpec(spec: string): RoleCreateParseResult {
 }
 
 export class CommandHandler {
-  private parseProviderModel(raw?: string): { providerId: string; modelId: string } | null {
+  /** 若 OpenCode 中已无该角色，清除或修正名称；发消息前调用 */
+  public async sanitizePreferredAgentForChat(chatId: string): Promise<void> {
+    const session = chatSessionStore.getSession(chatId);
+    const raw = normalizeAgentName(session?.preferredAgent);
     if (!raw) {
-      return null;
+      if (session?.preferredAgent) {
+        chatSessionStore.updateConfig(chatId, { preferredAgent: undefined });
+      }
+      return;
     }
 
-    const trimmed = raw.trim();
-    if (!trimmed) {
-      return null;
+    let agents: OpencodeAgentInfo[];
+    try {
+      agents = await activeBackend.getAgents();
+    } catch {
+      console.warn(`[Command] 无法连接 OpenCode 校验角色有效性，已清除 preferredAgent: ${raw}`);
+      chatSessionStore.updateConfig(chatId, { preferredAgent: undefined });
+      return;
     }
 
-    const separator = trimmed.includes(':') ? ':' : (trimmed.includes('/') ? '/' : '');
-    if (!separator) {
-      return null;
+    const visible = agents.filter(a => isAgentVisibleInPanel(a));
+    const normalizedNames = visible.map(a => normalizeAgentName(a.name)).filter(Boolean) as string[];
+    if (normalizedNames.includes(raw)) {
+      if (raw !== session?.preferredAgent) {
+        chatSessionStore.updateConfig(chatId, { preferredAgent: raw });
+      }
+      return;
     }
 
-    const splitIndex = trimmed.indexOf(separator);
-    const providerId = trimmed.slice(0, splitIndex).trim();
-    const modelId = trimmed.slice(splitIndex + 1).trim();
-    if (!providerId || !modelId) {
-      return null;
+    console.warn(`[Command] 会话角色在 OpenCode 中已不存在，已清除: ${raw}`);
+    chatSessionStore.updateConfig(chatId, { preferredAgent: undefined });
+  }
+
+  /** 切换模型后写入「最近使用」，供面板置顶 */
+  public recordRecentModelForChat(chatId: string, modelValue: string): void {
+    chatSessionStore.pushRecentModel(chatId, modelValue);
+  }
+
+  /** 与 GroupHandler.processPrompt 一致：解析当前会话应使用的 provider/model */
+  private async resolvePromptModelOptionsForChat(
+    chatId: string
+  ): Promise<{ providerId?: string; modelId?: string }> {
+    let providerId: string | undefined;
+    let modelId: string | undefined;
+
+    if (modelConfig.defaultProvider && modelConfig.defaultModel) {
+      providerId = modelConfig.defaultProvider;
+      modelId = modelConfig.defaultModel;
     }
 
-    return { providerId, modelId };
+    const session = chatSessionStore.getSession(chatId);
+    if (session?.preferredModel) {
+      const raw = session.preferredModel.trim();
+      const parsed = parseProviderModelString(raw);
+      if (parsed) {
+        providerId = parsed.providerId;
+        modelId = parsed.modelId;
+      } else if (providerId) {
+        modelId = raw;
+      }
+    }
+
+    if (providerId && modelId) {
+      return { providerId, modelId };
+    }
+    return {};
+  }
+
+  private parseProviderModel(raw?: string): { providerId: string; modelId: string } | null {
+    return parseProviderModelString(raw);
   }
 
   private extractProviderId(provider: unknown): string | undefined {
@@ -511,7 +560,7 @@ export class CommandHandler {
 
   private resolveModelFromProviderPayload(
     chatId: string,
-    providersResult: Awaited<ReturnType<typeof opencodeClient.getProviders>>
+    providersResult: Awaited<ReturnType<typeof activeBackend.getProviders>>
   ): { providerId: string; modelId: string } | null {
     const session = chatSessionStore.getSession(chatId);
     const preferredModel = this.parseProviderModel(session?.preferredModel);
@@ -585,7 +634,7 @@ export class CommandHandler {
   }
 
   private async getEffortSupportInfo(chatId: string): Promise<EffortSupportInfo> {
-    const providersResult = await opencodeClient.getProviders();
+    const providersResult = await activeBackend.getProviders();
     const model = this.resolveModelFromProviderPayload(chatId, providersResult);
     if (!model) {
       return {
@@ -646,7 +695,7 @@ export class CommandHandler {
   }
 
   private async resolveCompactModel(chatId: string): Promise<{ providerId: string; modelId: string } | null> {
-    const providersResult = await opencodeClient.getProviders();
+    const providersResult = await activeBackend.getProviders();
     return this.resolveModelFromProviderPayload(chatId, providersResult);
   }
 
@@ -660,7 +709,7 @@ export class CommandHandler {
     }
 
     try {
-      const agents = await opencodeClient.getAgents();
+      const agents = await activeBackend.getAgents();
       if (!Array.isArray(agents) || agents.length === 0) {
         return fallbackAgent;
       }
@@ -700,7 +749,7 @@ export class CommandHandler {
       return;
     }
 
-    const compacted = await opencodeClient.summarizeSession(sessionId, model.providerId, model.modelId);
+    const compacted = await activeBackend.summarizeSession(sessionId, model.providerId, model.modelId);
     if (!compacted) {
       await feishuClient.reply(messageId, `❌ 上下文压缩失败（模型: ${model.providerId}:${model.modelId}）`);
       return;
@@ -781,7 +830,7 @@ export class CommandHandler {
         case 'stop':
           const sessionId = chatSessionStore.getSessionId(chatId);
           if (sessionId) {
-            await opencodeClient.abortSession(sessionId);
+            await activeBackend.abortSession(sessionId);
             await feishuClient.reply(messageId, '⏹️ 已发送中断请求');
           } else {
             await feishuClient.reply(messageId, '当前没有活跃的会话');
@@ -843,6 +892,10 @@ export class CommandHandler {
           await this.handleRename(chatId, messageId, command.renameTitle);
           break;
 
+        case 'cleanup':
+          await this.handleCleanupSessions(messageId);
+          break;
+
         // 其他命令透传
         default:
           await this.handlePassthroughCommand(chatId, messageId, command.type.replace(/^\//, ''), command.commandArgs || '');
@@ -852,6 +905,22 @@ export class CommandHandler {
       const errorMessage = error instanceof Error ? error.message : String(error);
       console.error('[Command] 执行失败详情:', errorMessage);
       await feishuClient.reply(messageId, '❌ 命令执行出错，请稍后重试');
+    }
+  }
+
+  private async handleCleanupSessions(messageId: string): Promise<void> {
+    const scriptPath = `${process.env.HOME}/.local/share/opencode/cleanup-sessions.sh`;
+    await feishuClient.reply(messageId, '🧹 正在清理历史 sessions...');
+    try {
+      const { execFile } = await import('child_process');
+      const { promisify } = await import('util');
+      const execFileAsync = promisify(execFile);
+      const { stdout } = await execFileAsync('bash', [scriptPath], { timeout: 30000 });
+      const clean = stdout.replace(/\x1b\[[0-9;]*m/g, '').trim();
+      await feishuClient.reply(messageId, `✅ 清理完成\n\`\`\`\n${clean}\n\`\`\``);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      await feishuClient.reply(messageId, `❌ 清理失败: ${msg}`);
     }
   }
 
@@ -876,7 +945,7 @@ export class CommandHandler {
       return;
     }
 
-    const success = await opencodeClient.updateSession(sessionId, trimmedTitle);
+    const success = await activeBackend.updateSession(sessionId, trimmedTitle);
     if (success) {
       // 同步更新本地缓存中的会话标题
       chatSessionStore.updateTitle(chatId, trimmedTitle);
@@ -930,7 +999,7 @@ export class CommandHandler {
     const effectiveDir = dirResult.source === 'server_default' ? undefined : dirResult.directory;
 
     try {
-      const session = await opencodeClient.createSession(title, effectiveDir);
+      const session = await activeBackend.createSession(title, effectiveDir);
       if (session) {
         chatSessionStore.setSession(chatId, session.id, userId, title, {
           chatType,
@@ -948,8 +1017,9 @@ export class CommandHandler {
         await feishuClient.reply(messageId, '❌ 创建会话失败');
       }
     } catch (error) {
+      const errMsg = error instanceof Error ? error.message : String(error);
       console.error('[Command] 创建会话失败:', error);
-      await feishuClient.reply(messageId, '❌ 创建会话失败，请检查目录是否为有效的代码仓库\n使用 /project list 查看可用项目');
+      await feishuClient.reply(messageId, `❌ 创建会话失败: ${errMsg}\n使用 /project list 查看可用项目`);
     }
   }
 
@@ -959,7 +1029,7 @@ export class CommandHandler {
     let knownDirs: string[] = [...storeKnownDirs];
     try {
        // 注意：这里使用 listSessionsAcrossProjects 从已知目录获取会话
-      const sessions = await opencodeClient.listSessionsAcrossProjects();
+      const sessions = await activeBackend.listSessionsAcrossProjects();
       const sessionDirs = sessions
         .map((session: any) => session.directory)
         .filter((directory: string): directory is string => Boolean(directory));
@@ -1048,7 +1118,7 @@ export class CommandHandler {
       return;
     }
 
-    const targetSession = await opencodeClient.findSessionAcrossProjects(normalizedSessionId);
+    const targetSession = await activeBackend.findSessionAcrossProjects(normalizedSessionId);
     if (!targetSession) {
       await feishuClient.reply(messageId, `❌ 未找到会话: ${normalizedSessionId}`);
       return;
@@ -1085,7 +1155,7 @@ export class CommandHandler {
   }
 
   private async handleListSessions(chatId: string, messageId: string, listAll: boolean = false): Promise<void> {
-    let sessions: Awaited<ReturnType<typeof opencodeClient.listSessions>> = [];
+    let sessions: Awaited<ReturnType<typeof activeBackend.listSessions>> = [];
     let opencodeUnavailable = false;
 
     // 获取当前群的工作目录，用于非全量模式下过滤
@@ -1096,10 +1166,10 @@ export class CommandHandler {
       if (listAll) {
         // 全量：聚合所有已知目录的会话
         const storeKnownDirs = chatSessionStore.getKnownDirectories();
-        sessions = await opencodeClient.listAllSessions(storeKnownDirs);
+        sessions = await activeBackend.listAllSessions(storeKnownDirs);
       } else {
         // 默认：只查当前项目目录的会话
-        sessions = await opencodeClient.listSessions(currentDirectory ? { directory: currentDirectory } : undefined);
+        sessions = await activeBackend.listSessions(currentDirectory ? { directory: currentDirectory } : undefined);
       }
     } catch (error) {
       opencodeUnavailable = true;
@@ -1251,7 +1321,7 @@ export class CommandHandler {
          const chatDefault = chatSessionStore.getSession(chatId)?.defaultDirectory;
          const dirResult = DirectoryPolicy.resolve({ chatDefaultDirectory: chatDefault });
          const effectiveDir = dirResult.ok && dirResult.source !== 'server_default' ? dirResult.directory : undefined;
-         const newSession = await opencodeClient.createSession(title, effectiveDir);
+         const newSession = await activeBackend.createSession(title, effectiveDir);
           if (newSession) {
                chatSessionStore.setSession(chatId, newSession.id, userId, title, { chatType, resolvedDirectory: newSession.directory });
                session = chatSessionStore.getSession(chatId);
@@ -1262,19 +1332,23 @@ export class CommandHandler {
       }
 
 
-      // 1. 如果没有提供模型名称，显示当前状态
-      if (!modelName) {
+      // 1. 如果没有提供模型名称，显示当前状态并提示用法
+      const trimmedModelName = modelName?.trim();
+      if (!trimmedModelName) {
         const envDefaultModel = modelConfig.defaultProvider && modelConfig.defaultModel
           ? `${modelConfig.defaultProvider}:${modelConfig.defaultModel}`
           : undefined;
         const currentModel = session?.preferredModel || envDefaultModel || '跟随 OpenCode 默认模型';
-        await feishuClient.reply(messageId, `当前模型: ${currentModel}`);
+        await feishuClient.reply(
+          messageId,
+          `当前模型: ${currentModel}\n\n切换模型: \`/model <名称>\`，例如 \`/model gpt-4o\` 或 \`/model anthropic:claude-sonnet-4-5\`\n可用 \`/panel\` 查看完整列表`
+        );
         return;
       }
 
-      const providersResult = await opencodeClient.getProviders();
+      const providersResult = await activeBackend.getProviders();
       const providers = Array.isArray(providersResult.providers) ? providersResult.providers : [];
-      const normalizedModelName = modelName.trim();
+      const normalizedModelName = trimmedModelName;
       const normalizedModelNameLower = normalizedModelName.toLowerCase();
 
       let matchedModel: ProviderModelMeta | null = null;
@@ -1287,8 +1361,11 @@ export class CommandHandler {
             candidate.modelId,
             candidate.modelName,
           ].filter((item): item is string => typeof item === 'string' && item.trim().length > 0);
-          const isMatched = candidateValues.some(item => item.toLowerCase() === normalizedModelNameLower);
-          if (!isMatched) {
+          const isExactMatch = candidateValues.some(item => item.toLowerCase() === normalizedModelNameLower);
+          const isPrefixMatch = !isExactMatch && candidateValues.some(
+            item => item.toLowerCase().startsWith(normalizedModelNameLower)
+          );
+          if (!isExactMatch && !isPrefixMatch) {
             continue;
           }
 
@@ -1305,6 +1382,7 @@ export class CommandHandler {
         // 3. 更新配置
         const newValue = `${matchedModel.providerId}:${matchedModel.modelId}`;
         chatSessionStore.updateConfig(chatId, { preferredModel: newValue });
+        this.recordRecentModelForChat(chatId, newValue);
 
         const lines = [`✅ 已切换模型: ${newValue}`];
         const reconciled = await this.reconcilePreferredEffort(chatId);
@@ -1316,20 +1394,25 @@ export class CommandHandler {
 
         await feishuClient.reply(messageId, lines.join('\n'));
       } else {
-        // 即使没找到匹配的，如果格式正确也允许强制设置（针对自定义或未列出的模型）
-        if (normalizedModelName.includes(':') || normalizedModelName.includes('/')) {
-             const separator = normalizedModelName.includes(':') ? ':' : '/';
-             const [provider, model] = normalizedModelName.split(separator);
-             const newValue = `${provider}:${model}`;
-             chatSessionStore.updateConfig(chatId, { preferredModel: newValue });
+        const forced = parseProviderModelString(normalizedModelName);
+        if (forced) {
+          const newValue = `${forced.providerId}:${forced.modelId}`;
+          chatSessionStore.updateConfig(chatId, { preferredModel: newValue });
+          this.recordRecentModelForChat(chatId, newValue);
 
-             const currentEffort = chatSessionStore.getSession(chatId)?.preferredEffort;
-             const warning = currentEffort
-               ? '\n⚠️ 当前模型不在列表中，无法校验已设置强度是否兼容。'
-               : '';
-             await feishuClient.reply(messageId, `⚠️ 未在列表中找到该模型，但已强制设置为: ${newValue}${warning}`);
+          const currentEffort = chatSessionStore.getSession(chatId)?.preferredEffort;
+          const warning = currentEffort
+            ? '\n⚠️ 当前模型不在列表中，无法校验已设置强度是否兼容。'
+            : '';
+          await feishuClient.reply(
+            messageId,
+            `⚠️ 未在列表中找到该模型，但已强制设置为: ${newValue}${warning}`
+          );
         } else {
-             await feishuClient.reply(messageId, `❌ 未找到模型 "${normalizedModelName}"\n请使用 /panel 查看可用列表`);
+          await feishuClient.reply(
+            messageId,
+            `❌ 未找到模型 "${normalizedModelName}"\n请使用 /panel 查看可用列表，或使用 \`provider:model\` 格式强制指定`
+          );
         }
       }
 
@@ -1353,7 +1436,7 @@ export class CommandHandler {
         const chatDefault = chatSessionStore.getSession(chatId)?.defaultDirectory;
         const dirResult = DirectoryPolicy.resolve({ chatDefaultDirectory: chatDefault });
         const effectiveDir = dirResult.ok && dirResult.source !== 'server_default' ? dirResult.directory : undefined;
-        const newSession = await opencodeClient.createSession(title, effectiveDir);
+        const newSession = await activeBackend.createSession(title, effectiveDir);
         if (newSession) {
           chatSessionStore.setSession(chatId, newSession.id, userId, title, { chatType, resolvedDirectory: newSession.directory });
           session = chatSessionStore.getSession(chatId);
@@ -1431,7 +1514,7 @@ export class CommandHandler {
   }
 
   private getVisibleAgents(agents: OpencodeAgentInfo[]): OpencodeAgentInfo[] {
-    return agents.filter(agent => agent.hidden !== true && !INTERNAL_HIDDEN_AGENT_NAMES.has(agent.name));
+    return agents.filter(agent => isAgentVisibleInPanel(agent));
   }
 
   private getAgentModePrefix(agent: OpencodeAgentInfo): string {
@@ -1568,7 +1651,7 @@ export class CommandHandler {
       const chatDefault = chatSessionStore.getSession(chatId)?.defaultDirectory;
       const dirResult = DirectoryPolicy.resolve({ chatDefaultDirectory: chatDefault });
       const effectiveDir = dirResult.ok && dirResult.source !== 'server_default' ? dirResult.directory : undefined;
-      const newSession = await opencodeClient.createSession(title, effectiveDir);
+      const newSession = await activeBackend.createSession(title, effectiveDir);
       if (!newSession) {
         await feishuClient.reply(messageId, '❌ 无法创建会话以保存角色设置');
         return;
@@ -1579,8 +1662,8 @@ export class CommandHandler {
 
     const payload = parsed.payload;
     const [agents, config] = await Promise.all([
-      opencodeClient.getAgents(),
-      opencodeClient.getConfig(),
+      activeBackend.getAgents(),
+      activeBackend.getConfig(),
     ]);
 
     const roleAgentMap = this.getRoleAgentMap(config);
@@ -1606,7 +1689,7 @@ export class CommandHandler {
       },
     };
 
-    const updated = await opencodeClient.updateConfig(nextConfig);
+    const updated = await activeBackend.updateConfig(nextConfig);
     if (!updated) {
       await feishuClient.reply(messageId, '❌ 创建角色失败：写入 OpenCode 配置失败');
       return;
@@ -1639,7 +1722,7 @@ export class CommandHandler {
         const chatDefault = chatSessionStore.getSession(chatId)?.defaultDirectory;
         const dirResult = DirectoryPolicy.resolve({ chatDefaultDirectory: chatDefault });
         const effectiveDir = dirResult.ok && dirResult.source !== 'server_default' ? dirResult.directory : undefined;
-        const newSession = await opencodeClient.createSession(title, effectiveDir);
+        const newSession = await activeBackend.createSession(title, effectiveDir);
         if (newSession) {
           chatSessionStore.setSession(chatId, newSession.id, userId, title, { chatType, resolvedDirectory: newSession.directory });
           session = chatSessionStore.getSession(chatId);
@@ -1649,7 +1732,7 @@ export class CommandHandler {
         }
       }
 
-      const visibleAgents = this.getVisibleAgents(await opencodeClient.getAgents());
+      const visibleAgents = this.getVisibleAgents(await activeBackend.getAgents());
       const currentAgent = session?.preferredAgent;
 
       if (!agentName) {
@@ -1684,9 +1767,9 @@ export class CommandHandler {
 
     // 获取列表供卡片使用
     const [{ providers }, allAgents, runtimeConfig] = await Promise.all([
-      opencodeClient.getProviders(),
-      opencodeClient.getAgents(),
-      opencodeClient.getConfig(),
+      activeBackend.getProviders(),
+      activeBackend.getAgents(),
+      activeBackend.getConfig(),
     ]);
 
     const visibleAgents = this.getVisibleAgents(allAgents);
@@ -1724,7 +1807,23 @@ export class CommandHandler {
     }
 
     const selectedModel = session?.preferredModel || '';
-    let panelModelOptions = modelOptions.slice(0, PANEL_MODEL_OPTION_LIMIT);
+    const recentIds = session?.recentModelIds || [];
+    const recentSet = new Set(recentIds);
+    const recentOptions: { label: string; value: string }[] = [];
+    for (const id of recentIds) {
+      const fromFull = modelOptions.find(item => item.value === id);
+      if (fromFull) {
+        recentOptions.push({ label: `⭐ 最近 · ${fromFull.label}`, value: fromFull.value });
+      } else {
+        recentOptions.push({ label: `⭐ 最近 · ${id}`, value: id });
+      }
+    }
+    const rest = modelOptions.filter(
+      item => !recentSet.has(item.value)
+    );
+    const mergedModelOptions = [...recentOptions, ...rest];
+
+    let panelModelOptions = mergedModelOptions.slice(0, PANEL_MODEL_OPTION_LIMIT);
     if (selectedModel.includes(':') && panelModelOptions.every(item => item.value !== selectedModel)) {
       const matched = modelOptions.find(item => item.value === selectedModel);
       if (matched) {
@@ -1762,6 +1861,11 @@ export class CommandHandler {
     await feishuClient.sendCard(chatId, card);
   }
 
+  /** 获取控制面板卡片（用于 model_select 等动作后原地更新） */
+  public async getPanelCard(chatId: string, chatType: 'p2p' | 'group' = 'group'): Promise<object> {
+    return this.buildPanelCard(chatId, chatType);
+  }
+
   private async handlePanel(chatId: string, messageId: string, chatType: 'p2p' | 'group'): Promise<void> {
     const card = await this.buildPanelCard(chatId, chatType);
     if (messageId) {
@@ -1789,6 +1893,8 @@ export class CommandHandler {
     console.log(`[Command] 透传命令到 OpenCode: ${shownCommand}`);
 
     try {
+      const promptModel = await this.resolvePromptModelOptionsForChat(chatId);
+
       if (commandPrefix === '!') {
         const shellCommand = commandArgs.trim();
         if (!shellCommand) {
@@ -1799,7 +1905,17 @@ export class CommandHandler {
         const shellAgent = await this.resolveShellAgent(chatId);
         const shellSessionData = chatSessionStore.getSession(chatId);
         const shellDirectory = shellSessionData?.sessionDirectory;
-        const result = await opencodeClient.sendShellCommand(sessionId, shellCommand, shellAgent, shellDirectory ? { directory: shellDirectory } : undefined);
+        const result = await activeBackend.sendShellCommand(
+          sessionId,
+          shellCommand,
+          shellAgent,
+          {
+            ...(shellDirectory ? { directory: shellDirectory } : {}),
+            ...(promptModel.providerId && promptModel.modelId
+              ? { providerId: promptModel.providerId, modelId: promptModel.modelId }
+              : {}),
+          }
+        );
         const output = this.formatOutput(result.parts);
         if (output !== '(无输出)') {
           await feishuClient.reply(messageId, output);
@@ -1810,18 +1926,35 @@ export class CommandHandler {
         return;
       }
 
-      // 使用专门的 sendCommand 方法（传递工作目录以切换 Instance 上下文）
+      // 使用流式路径（prompt_async）执行命令，结果通过 SSE 推送到飞书卡片
+      // 避免阻塞 sendCommand 因 LLM 推理耗时超时导致无响应
       const cmdSessionData = chatSessionStore.getSession(chatId);
-      const cmdDirectory = cmdSessionData?.sessionDirectory;
-      const result = await opencodeClient.sendCommand(sessionId, commandName, commandArgs, cmdDirectory ? { directory: cmdDirectory } : undefined);
+      const cmdDirectory = cmdSessionData?.sessionDirectory || cmdSessionData?.resolvedDirectory;
 
-      // 处理返回结果
-      if (result && result.parts) {
-        const output = this.formatOutput(result.parts);
-        await feishuClient.reply(messageId, output);
-      } else {
-        await feishuClient.reply(messageId, `✅ 命令执行完成: ${shownCommand}`);
+      // 建立 outputBuffer，SSE 事件回来后 index.ts 会把内容推到飞书
+      const bufferKey = `chat:${chatId}`;
+      const existing = outputBuffer.get(bufferKey);
+      if (existing) {
+        outputBuffer.clear(bufferKey);
       }
+      outputBuffer.getOrCreate(bufferKey, chatId, sessionId, messageId, 'command:passthrough');
+      void feishuClient.addReaction(messageId, 'Typing').catch(() => undefined);
+
+      void activeBackend.sendMessageAsync(
+        sessionId,
+        shownCommand,
+        {
+          ...(promptModel.providerId && promptModel.modelId
+            ? { providerId: promptModel.providerId, modelId: promptModel.modelId }
+            : {}),
+          ...(cmdDirectory ? { directory: cmdDirectory } : {}),
+        }
+      ).catch((err: unknown) => {
+        const errorMessage = err instanceof Error ? err.message : String(err);
+        console.error('[Command] 透传命令流式发送失败:', errorMessage);
+        outputBuffer.append(bufferKey, `\n\n❌ ${errorMessage}`);
+        outputBuffer.setStatus(bufferKey, 'failed');
+      });
     } catch (error) {
       console.error('[Command] 透传命令失败:', error);
       await feishuClient.reply(messageId, `❌ 命令执行失败: ${error}`);
@@ -1891,7 +2024,7 @@ export class CommandHandler {
       // 删除指定会话
       await feishuClient.reply(messageId, `🧹 正在删除指定会话: ${normalizedTargetSessionId} ...`);
 
-      const targetSession = await opencodeClient.findSessionAcrossProjects(normalizedTargetSessionId);
+      const targetSession = await activeBackend.findSessionAcrossProjects(normalizedTargetSessionId);
       if (!targetSession) {
         await feishuClient.reply(messageId, `❌ 未找到会话: ${normalizedTargetSessionId}`);
         return;
@@ -1910,7 +2043,7 @@ export class CommandHandler {
         }
       }
 
-      const deleted = await opencodeClient.deleteSession(normalizedTargetSessionId, {
+      const deleted = await activeBackend.deleteSession(normalizedTargetSessionId, {
         directory: targetSession.directory,
       });
       if (!deleted) {
@@ -1998,7 +2131,7 @@ export class CommandHandler {
         if (!skipOpenCodeRevert) {
             let targetRevertId = '';
             try {
-                const messages = await opencodeClient.getSessionMessages(session.sessionId);
+                const messages = await activeBackend.getSessionMessages(session.sessionId);
                 
                 // Find the AI message
                 // For question_answer type, openCodeMsgId is empty, so this will be -1
@@ -2032,7 +2165,7 @@ export class CommandHandler {
             }
 
             if (targetRevertId) {
-                 await opencodeClient.revertMessage(session.sessionId, targetRevertId);
+                 await activeBackend.revertMessage(session.sessionId, targetRevertId);
             }
         }
 

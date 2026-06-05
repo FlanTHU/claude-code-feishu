@@ -72,10 +72,10 @@ class DelayedResponseHandler {
     const now = Date.now();
     const expired: PendingRequest[] = [];
 
-    for (const [sessionId, request] of this.pending.entries()) {
+    for (const [messageId, request] of this.pending.entries()) {
       if (now - request.createdAt > timeoutMs) {
         expired.push(request);
-        this.pending.delete(sessionId);
+        this.pending.delete(messageId);
       }
     }
 

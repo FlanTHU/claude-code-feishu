@@ -14,6 +14,7 @@
 
 import type { PermissionRequestEvent } from '../opencode/client.js';
 import { opencodeClient } from '../opencode/client.js';
+import { activeBackend } from '../backend/active.js';
 import { chatSessionStore } from '../store/chat-session.js';
 import { permissionHandler } from '../permissions/handler.js';
 import { questionHandler } from '../opencode/question-handler.js';
@@ -128,12 +129,73 @@ export interface OpenCodeEventContext {
 }
 
 /**
+ * compaction 期间缓存的待发消息
+ */
+export type PendingCompactionMessage = {
+  sessionId: string;
+  chatId: string;
+  text: string;
+  messageId: string;
+  attachments?: import('../feishu/client.js').FeishuAttachment[];
+  config?: { preferredModel?: string; preferredAgent?: string; preferredEffort?: import('../commands/effort.js').EffortLevel };
+  promptEffort?: import('../commands/effort.js').EffortLevel;
+};
+
+/**
  * OpenCode 事件中心
  */
 export class OpenCodeEventHub {
   private context: OpenCodeEventContext | null = null;
   private registered: boolean = false;
+  private compactionSeenMap: Map<string, number> = new Map();
   private userMessageIdsBySession = new Map<string, Set<string>>();
+  private completedMessageIds: Set<string> = new Set();
+  private readonly COMPLETED_MSG_IDS_MAX = 500;
+  private activeBufferKeys: Set<string> = new Set();
+
+  /** compaction 期间缓存的消息，key = sessionId */
+  private compactionMessageQueue: Map<string, PendingCompactionMessage[]> = new Map();
+
+  /** 重发回调，由 group.ts 注入，避免循环依赖 */
+  private replayHandler: ((msg: PendingCompactionMessage) => Promise<void>) | null = null;
+
+  /**
+   * 注册 compaction 结束后的消息重发回调
+   */
+  setReplayHandler(handler: (msg: PendingCompactionMessage) => Promise<void>): void {
+    this.replayHandler = handler;
+  }
+
+  markMessageCompleted(messageId: string): void {
+    if (!messageId) return;
+    this.completedMessageIds.add(messageId);
+    if (this.completedMessageIds.size > this.COMPLETED_MSG_IDS_MAX) {
+      const first = this.completedMessageIds.values().next().value;
+      if (first) this.completedMessageIds.delete(first);
+    }
+  }
+
+  registerActiveBuffer(bufferKey: string): void {
+    this.activeBufferKeys.add(bufferKey);
+  }
+
+  unregisterActiveBuffer(bufferKey: string): void {
+    this.activeBufferKeys.delete(bufferKey);
+  }
+
+  isBufferActive(bufferKey: string): boolean {
+    return this.activeBufferKeys.has(bufferKey);
+  }
+
+  /**
+   * 将消息加入 compaction 缓存队列
+   */
+  enqueueCompactionMessage(msg: PendingCompactionMessage): void {
+    const queue = this.compactionMessageQueue.get(msg.sessionId) ?? [];
+    queue.push(msg);
+    this.compactionMessageQueue.set(msg.sessionId, queue);
+    console.log(`[EventHub] compaction 期间缓存消息: session=${msg.sessionId.slice(0, 8)}..., queue=${queue.length}`);
+  }
 
   private resolveConversationRoute(
     sessionId: string,
@@ -191,6 +253,35 @@ export class OpenCodeEventHub {
     this.userMessageIdsBySession.delete(sessionId);
   }
 
+  private flushCompactionQueue(
+    sessionId: string,
+    store: typeof import('../store/chat-session.js').chatSessionStore
+  ): void {
+    store.setCompacting(sessionId, false);
+    const queue = this.compactionMessageQueue.get(sessionId);
+    if (!queue || queue.length === 0) return;
+    this.compactionMessageQueue.delete(sessionId);
+    console.log(`[EventHub] compaction 完成，重发 ${queue.length} 条缓存消息: session=${sessionId.slice(0, 8)}...`);
+    if (!this.replayHandler) {
+      console.warn('[EventHub] replayHandler 未注册，缓存消息丢失');
+      return;
+    }
+    const handler = this.replayHandler;
+    void (async () => {
+      for (const msg of queue) {
+        try {
+          await handler(msg);
+        } catch (err) {
+          console.error('[EventHub] 重发缓存消息失败:', err);
+        }
+      }
+      const remaining = this.compactionMessageQueue.get(sessionId);
+      if (remaining && remaining.length > 0) {
+        this.flushCompactionQueue(sessionId, store);
+      }
+    })();
+  }
+
   /**
    * 注入事件处理上下文
    */
@@ -209,25 +300,28 @@ export class OpenCodeEventHub {
     this.registered = true;
 
     // 权限请求
-    opencodeClient.on('permissionRequest', (event) => this.handlePermissionRequest(event));
+    activeBackend.on('permissionRequest', (event) => this.handlePermissionRequest(event));
+
+    // 会话更新（compaction 检测）
+    activeBackend.on('sessionUpdated', (event) => this.handleSessionUpdated(event));
 
     // 会话状态变化
-    opencodeClient.on('sessionStatus', (event) => this.handleSessionStatus(event));
+    activeBackend.on('sessionStatus', (event) => this.handleSessionStatus(event));
 
     // 会话空闲
-    opencodeClient.on('sessionIdle', (event) => this.handleSessionIdle(event));
+    activeBackend.on('sessionIdle', (event) => this.handleSessionIdle(event));
 
     // 消息更新
-    opencodeClient.on('messageUpdated', (event) => this.handleMessageUpdated(event));
+    activeBackend.on('messageUpdated', (event) => this.handleMessageUpdated(event));
 
     // 会话错误
-    opencodeClient.on('sessionError', (event) => this.handleSessionError(event));
+    activeBackend.on('sessionError', (event) => this.handleSessionError(event));
 
     // 消息部分更新（流式输出）
-    opencodeClient.on('messagePartUpdated', (event) => this.handleMessagePartUpdated(event));
+    activeBackend.on('messagePartUpdated', (event) => this.handleMessagePartUpdated(event));
 
     // AI 提问
-    opencodeClient.on('questionAsked', (event) => this.handleQuestionAsked(event));
+    activeBackend.on('questionAsked', (event) => this.handleQuestionAsked(event));
   }
 
   // ==================== 私有事件处理器 ====================
@@ -277,8 +371,17 @@ export class OpenCodeEventHub {
       }
 
       const bufferKey = route.bufferKey;
-      if (!outputBuffer.get(bufferKey)) {
-        outputBuffer.getOrCreate(bufferKey, route.conversationId, event.sessionId, null);
+      let permBuf = outputBuffer.get(bufferKey);
+      if (!permBuf) {
+        // buffer 不存在时（如 bridge 重启后），尝试创建以确保权限入队正常工作
+        permBuf = outputBuffer.getOrCreate(bufferKey, route.conversationId, event.sessionId, null);
+        if (!permBuf) {
+          console.log(`[权限] buffer 创建失败，跳过权限入队: permission=${event.permissionId}`);
+          return;
+        }
+      } else if (permBuf.sessionId !== event.sessionId) {
+        console.log(`[权限] session mismatch，跳过权限入队: event=${event.sessionId.slice(0, 12)}, buffer=${permBuf.sessionId.slice(0, 12)}`);
+        return;
       }
 
       const permissionInfo = {
@@ -386,6 +489,49 @@ export class OpenCodeEventHub {
     }
   }
 
+  private handleSessionUpdated(event: unknown): void {
+    if (!this.context) return;
+
+    const { toSessionId, chatSessionStore, outputBuffer, upsertTimelineNote } = this.injectedDependencies();
+
+    const eventObj = event as Record<string, unknown>;
+    const info = eventObj?.info as Record<string, unknown> | undefined;
+    if (!info || typeof info !== 'object') return;
+
+    const sessionID = toSessionId(info.id || info.sessionID || info.sessionId);
+    if (!sessionID) return;
+
+    const time = info.time as Record<string, unknown> | undefined;
+    if (!time || typeof time.compacting !== 'number') return;
+
+    const compactingTs: number = time.compacting;
+    const lastSeen = this.compactionSeenMap.get(sessionID);
+    if (lastSeen === compactingTs) return;
+    this.compactionSeenMap.set(sessionID, compactingTs);
+
+    chatSessionStore.setCompacting(sessionID, true);
+
+    const chatId = chatSessionStore.getChatId(sessionID);
+    if (!chatId) return;
+
+    const route = this.resolveConversationRoute(sessionID, chatId);
+    const bufferKey = route.bufferKey;
+
+    if (!outputBuffer.get(bufferKey)) {
+      console.log(`[EventHub] compaction 检测到但 buffer 不存在，跳过: session=${sessionID.slice(0, 8)}`);
+      return;
+    }
+    const compactionBuf = outputBuffer.get(bufferKey)!;
+    if (compactionBuf.sessionId !== sessionID) {
+      console.log(`[EventHub] compaction session mismatch，跳过: event=${sessionID.slice(0, 12)}, buffer=${compactionBuf.sessionId.slice(0, 12)}`);
+      return;
+    }
+
+    const noteKey = `compaction:${sessionID}:${compactingTs}`;
+    upsertTimelineNote(bufferKey, noteKey, '⚠️ 上下文压缩中，新消息将在压缩完成后自动发送。', 'compaction');
+    outputBuffer.touch(bufferKey);
+    console.log(`[EventHub] 检测到 compaction: session=${sessionID.slice(0, 8)}..., ts=${compactingTs}`);
+  }
   private handleSessionStatus(event: unknown): void {
     if (!this.context) return;
 
@@ -396,13 +542,25 @@ export class OpenCodeEventHub {
     const status = eventObj?.status as Record<string, unknown> | undefined;
     if (!sessionID || !status || typeof status !== 'object') return;
 
-    const chatId = chatSessionStore.getChatId(sessionID);
+    const chatId = chatSessionStore.getChatId(sessionID) ?? outputBuffer.getChatIdBySessionId(sessionID);
     if (!chatId) return;
 
     const route = this.resolveConversationRoute(sessionID, chatId);
     const bufferKey = route.bufferKey;
-    if (!outputBuffer.get(bufferKey)) {
-      outputBuffer.getOrCreate(bufferKey, route.conversationId, sessionID, null);
+    const existingStatusBuf = outputBuffer.get(bufferKey);
+    if (!existingStatusBuf) {
+      if (status.type === 'idle') {
+        console.log(`[EventHub] handleSessionStatus idle, buffer gone, flushing compaction: session=${sessionID.slice(0, 12)}`);
+        this.flushCompactionQueue(sessionID, chatSessionStore);
+      } else {
+        console.log(`[EventHub] handleSessionStatus ${String(status.type)}, buffer gone, skipping: session=${sessionID.slice(0, 12)}`);
+      }
+      return;
+    }
+
+    if (existingStatusBuf.sessionId !== sessionID) {
+      console.log(`[EventHub] handleSessionStatus skipped: session mismatch, event=${sessionID.slice(0, 12)}, buffer=${existingStatusBuf.sessionId.slice(0, 12)}`);
+      return;
     }
 
     if (status.type === 'retry') {
@@ -420,9 +578,14 @@ export class OpenCodeEventHub {
     if (status.type === 'idle') {
       markActiveToolsCompleted(bufferKey);
       const buffer = outputBuffer.get(bufferKey);
-      if (buffer && buffer.status === 'running') {
-        outputBuffer.setStatus(bufferKey, 'completed');
+      if (buffer) {
+        const hasContent = (buffer.finalText?.trim().length ?? 0) > 0 || buffer.content.some(c => c.trim().length > 0);
+        // session.idle 为权威完成信号；若已有 assistant 内容，将 failed 纠正为 completed（session.error 可能为非致命工具错误）
+        if (buffer.status === 'running' || (buffer.status === 'failed' && hasContent)) {
+          outputBuffer.setStatus(bufferKey, 'completed', buffer.status === 'failed');
+        }
       }
+      this.flushCompactionQueue(sessionID, chatSessionStore);
     }
   }
 
@@ -435,23 +598,37 @@ export class OpenCodeEventHub {
     const sessionID = toSessionId(eventObj?.sessionID || eventObj?.sessionId);
     if (!sessionID) return;
 
-    const chatId = chatSessionStore.getChatId(sessionID);
+    const chatId = chatSessionStore.getChatId(sessionID) ?? outputBuffer.getChatIdBySessionId(sessionID);
     if (!chatId) return;
 
     const route = this.resolveConversationRoute(sessionID, chatId);
     const bufferKey = route.bufferKey;
+    const existingIdleBuf = outputBuffer.get(bufferKey);
+    if (!existingIdleBuf) {
+      this.clearUserMessageIds(sessionID);
+      this.flushCompactionQueue(sessionID, chatSessionStore);
+      return;
+    }
+    if (existingIdleBuf.sessionId !== sessionID) {
+      console.log(`[EventHub] handleSessionIdle skipped: session mismatch, event=${sessionID.slice(0, 12)}, buffer=${existingIdleBuf.sessionId.slice(0, 12)}`);
+      return;
+    }
     markActiveToolsCompleted(bufferKey);
     const buffer = outputBuffer.get(bufferKey);
-    if (buffer && buffer.status === 'running') {
-      outputBuffer.setStatus(bufferKey, 'completed');
+    if (buffer) {
+      const hasContent = (buffer.finalText?.trim().length ?? 0) > 0 || buffer.content.some(c => c.trim().length > 0);
+      if (buffer.status === 'running' || (buffer.status === 'failed' && hasContent)) {
+        outputBuffer.setStatus(bufferKey, 'completed', buffer.status === 'failed');
+      }
     }
     this.clearUserMessageIds(sessionID);
+    this.flushCompactionQueue(sessionID, chatSessionStore);
   }
 
   private async handleMessageUpdated(event: unknown): Promise<void> {
     if (!this.context) return;
 
-    const { toSessionId, chatSessionStore, outputBuffer, CORRELATION_CACHE_TTL_MS, setCorrelationChatRef, messageChatMap, formatProviderError, applyFailureToSession } = this.injectedDependencies();
+    const { toSessionId, chatSessionStore, outputBuffer, CORRELATION_CACHE_TTL_MS, setCorrelationChatRef, messageChatMap, formatProviderError, upsertTimelineNote } = this.injectedDependencies();
 
     const eventObj = event as Record<string, unknown>;
     const info = eventObj?.info as Record<string, unknown> | undefined;
@@ -475,20 +652,29 @@ export class OpenCodeEventHub {
 
     const route = this.resolveConversationRoute(sessionID, chatId);
     const bufferKey = route.bufferKey;
-    if (!outputBuffer.get(bufferKey)) {
-      outputBuffer.getOrCreate(bufferKey, route.conversationId, sessionID, null);
+
+    const assistantMsgId = typeof info.id === 'string' ? info.id : '';
+    const existingBuf = outputBuffer.get(bufferKey);
+    if (!existingBuf) {
+      return;
+    }
+    if (existingBuf.sessionId !== sessionID) {
+      return;
     }
 
     chatSessionStore.rememberSessionAlias(sessionID, chatId, CORRELATION_CACHE_TTL_MS);
 
-    if (typeof info.id === 'string' && info.id) {
-      outputBuffer.setOpenCodeMsgId(bufferKey, info.id);
-      setCorrelationChatRef(messageChatMap, info.id, chatId);
+    if (assistantMsgId) {
+      outputBuffer.setOpenCodeMsgId(bufferKey, assistantMsgId);
+      setCorrelationChatRef(messageChatMap, assistantMsgId, chatId);
     }
 
     if (info.error) {
+      // message 级别的 error 只加 note，不把整个 buffer 标为 failed
+      // 真正的 session 失败由 sessionError 事件处理
       const text = formatProviderError(info.error);
-      await applyFailureToSession(sessionID, text);
+      upsertTimelineNote(bufferKey, `msg-error:${sessionID}:${String(info.id || Date.now())}`, `❌ ${text}`, 'error');
+      outputBuffer.touch(bufferKey);
     }
   }
 
@@ -500,7 +686,9 @@ export class OpenCodeEventHub {
     const eventObj = event as Record<string, unknown>;
     const sessionID = toSessionId(eventObj?.sessionID || eventObj?.sessionId);
     if (!sessionID) return;
+    console.error('[EventHub] session.error raw:', JSON.stringify(eventObj?.error ?? null));
     const text = formatProviderError(eventObj?.error);
+    console.error(`[EventHub] session.error formatted: "${text}", sessionID=${sessionID?.slice(0, 12)}`);
     await applyFailureToSession(sessionID, text);
     this.clearUserMessageIds(sessionID);
   }
@@ -545,13 +733,48 @@ export class OpenCodeEventHub {
       return;
     }
 
+    if (partMessageId && this.completedMessageIds.has(partMessageId)) {
+      // buffer 可能已 completed，但还有 late-arriving text delta
+      // 尝试追加到 finalText 并触发最后一次重渲染，防止末尾文字被截断
+      const lateTextDelta = typeof delta === 'string' && delta.length > 0 && part?.type === 'text' ? delta : null;
+      if (lateTextDelta) {
+        const chatId = chatSessionStore.getChatId(sessionID);
+        if (chatId) {
+          const route = this.resolveConversationRoute(sessionID, chatId);
+          const buf = outputBuffer.get(route.bufferKey);
+          if (buf && buf.status === 'completed' && !buf.cancelled) {
+            buf.finalText = (buf.finalText || '') + lateTextDelta;
+            outputBuffer.markDirty(route.bufferKey);
+            console.log(`[EventHub] late text delta appended to finalText (${lateTextDelta.length} chars): msgId=${partMessageId.slice(0, 12)}`);
+            return;
+          }
+        }
+      }
+      console.log(`[EventHub] messagePartUpdated skipped (completed): msgId=${partMessageId.slice(0, 12)}`);
+      return;
+    }
+    if (!partMessageId) {
+      console.log(`[EventHub] messagePartUpdated: NO partMessageId, part.type=${String(part?.type)}`);
+    }
+
     const chatId = chatSessionStore.getChatId(sessionID);
-    if (!chatId) return;
+    if (!chatId) {
+      console.warn(`[EventHub] messagePartUpdated 无会话映射(session->chatId)，事件被跳过: sessionID=${sessionID?.slice(0, 12)}...`);
+      return;
+    }
 
     const route = this.resolveConversationRoute(sessionID, chatId);
     const bufferKey = route.bufferKey;
-    if (!outputBuffer.get(bufferKey)) {
-      outputBuffer.getOrCreate(bufferKey, route.conversationId, sessionID, null);
+    const existingBuffer = outputBuffer.get(bufferKey);
+    if (!existingBuffer) {
+      console.log(`[EventHub] messagePartUpdated skipped: buffer gone (SSE replay), session=${sessionID?.slice(0, 12)}, msgId=${partMessageId.slice(0, 12)}`);
+      return;
+    }
+
+    // 如果 buffer 存在但 sessionId 不匹配，说明是旧 session 的 SSE replay 事件写入了新 session 的 buffer，跳过
+    if (existingBuffer.sessionId !== sessionID) {
+      console.log(`[EventHub] messagePartUpdated skipped: session mismatch (SSE replay), event.session=${sessionID?.slice(0, 12)}, buffer.session=${existingBuffer.sessionId?.slice(0, 12)}`);
+      return;
     }
 
     chatSessionStore.rememberSessionAlias(sessionID, chatId, CORRELATION_CACHE_TTL_MS);
@@ -658,7 +881,8 @@ export class OpenCodeEventHub {
     // Delta 字符串处理
     if (typeof delta === 'string') {
       if (delta.length > 0) {
-        if (part?.type === 'reasoning') {
+        // 修复：处理 reasoning 和 thinking 类型，将内容追加到 thinking 而非 content
+        if (part?.type === 'reasoning' || part?.type === 'thinking') {
           outputBuffer.appendThinking(bufferKey, delta);
           if (typeof part?.id === 'string') {
             const key = `${sessionID}:${part.id}`;
@@ -688,7 +912,8 @@ export class OpenCodeEventHub {
         return;
       }
 
-      if (part?.type === 'reasoning') {
+      // 修复：处理 reasoning 和 thinking 类型的空 delta
+      if (part?.type === 'reasoning' || part?.type === 'thinking') {
         appendReasoningFromPart(sessionID as string, part as { id?: unknown; text?: unknown }, bufferKey);
         return;
       }
@@ -744,8 +969,9 @@ export class OpenCodeEventHub {
           appendTimelineText(bufferKey, `text:${sessionID}:anonymous`, 'text', deltaObj.text);
         }
       } else if (typeof deltaObj.text === 'string' && deltaObj.text.length > 0) {
-        outputBuffer.append(bufferKey, deltaObj.text);
-        if (part?.type === 'reasoning') {
+        // 修复：reasoning 类型的内容只添加到 thinking，不添加到 text
+        if (part?.type === 'reasoning' || part?.type === 'thinking') {
+          outputBuffer.appendThinking(bufferKey, deltaObj.text);
           if (typeof part?.id === 'string' && part.id) {
             const key = `${sessionID}:${part.id}`;
             const prev = reasoningSnapshotMap.get(key) || '';
@@ -755,15 +981,18 @@ export class OpenCodeEventHub {
           } else {
             appendTimelineText(bufferKey, `reasoning:${sessionID}:anonymous`, 'reasoning', deltaObj.text);
           }
-        } else if (part?.type === 'text') {
-          if (typeof part?.id === 'string' && part.id) {
-            const key = `${sessionID}:${part.id}`;
-            const prev = textSnapshotMap.get(key) || '';
-            const next = `${prev}${deltaObj.text}`;
-            textSnapshotMap.set(key, next);
-            setTimelineText(bufferKey, `text:${key}`, 'text', next);
-          } else {
-            appendTimelineText(bufferKey, `text:${sessionID}:anonymous`, 'text', deltaObj.text);
+        } else {
+          outputBuffer.append(bufferKey, deltaObj.text);
+          if (part?.type === 'text') {
+            if (typeof part?.id === 'string' && part.id) {
+              const key = `${sessionID}:${part.id}`;
+              const prev = textSnapshotMap.get(key) || '';
+              const next = `${prev}${deltaObj.text}`;
+              textSnapshotMap.set(key, next);
+              setTimelineText(bufferKey, `text:${key}`, 'text', next);
+            } else {
+              appendTimelineText(bufferKey, `text:${sessionID}:anonymous`, 'text', deltaObj.text);
+            }
           }
         }
       }
@@ -791,7 +1020,12 @@ export class OpenCodeEventHub {
       console.log(`[问题] 收到提问: ${request.id} (Chat: ${chatId})`);
       const bufferKey = route.bufferKey;
       if (!outputBuffer.get(bufferKey)) {
-        outputBuffer.getOrCreate(bufferKey, route.conversationId, request.sessionID, null);
+        return;
+      }
+      const questionBuf = outputBuffer.get(bufferKey)!;
+      if (questionBuf.sessionId !== request.sessionID) {
+        console.log(`[问题] session mismatch，跳过: event=${request.sessionID.slice(0, 12)}, buffer=${questionBuf.sessionId.slice(0, 12)}`);
+        return;
       }
 
       questionHandler.register(request, bufferKey, route.conversationId);
@@ -810,7 +1044,7 @@ export class OpenCodeEventHub {
     chatSessionStore: typeof import('../store/chat-session.js').chatSessionStore;
     permissionHandler: typeof import('../permissions/handler.js').permissionHandler;
     questionHandler: typeof import('../opencode/question-handler.js').questionHandler;
-    opencodeClient: typeof import('../opencode/client.js').opencodeClient;
+    opencodeClient: import('../backend/types.js').AiBackend;
     outputBuffer: typeof import('../opencode/output-buffer.js').outputBuffer;
     feishuClient: typeof import('../feishu/client.js').feishuClient;
     // 从 context 解构
@@ -871,7 +1105,7 @@ export class OpenCodeEventHub {
       chatSessionStore,
       permissionHandler,
       questionHandler,
-      opencodeClient,
+      opencodeClient: activeBackend,
       outputBuffer,
       feishuClient,
       ...this.context,

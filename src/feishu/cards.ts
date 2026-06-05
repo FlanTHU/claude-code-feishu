@@ -12,6 +12,7 @@ export function buildPermissionCard(data: PermissionCardData): object {
   const riskText = data.risk === 'high' ? '⚠️ 高风险' : data.risk === 'medium' ? '⚡ 中等风险' : '✅ 低风险';
 
   return {
+    schema: '2.0',
     config: {
       wide_screen_mode: true,
     },
@@ -22,6 +23,7 @@ export function buildPermissionCard(data: PermissionCardData): object {
       },
       template: 'blue',
     },
+    body: {
     elements: [
       {
         tag: 'div',
@@ -48,61 +50,52 @@ export function buildPermissionCard(data: PermissionCardData): object {
         tag: 'hr',
       },
       {
-        tag: 'action',
-        actions: [
-          {
-            tag: 'button',
-            text: {
-              tag: 'plain_text',
-              content: '✅ 允许',
-            },
-            type: 'primary',
-            value: {
-              action: 'permission_allow',
-              sessionId: data.sessionId,
-              permissionId: data.permissionId,
-              remember: false,
-            },
-          },
-          {
-            tag: 'button',
-            text: {
-              tag: 'plain_text',
-              content: '❌ 拒绝',
-            },
-            type: 'danger',
-            value: {
-              action: 'permission_deny',
-              sessionId: data.sessionId,
-              permissionId: data.permissionId,
-            },
-          },
-          {
-            tag: 'button',
-            text: {
-              tag: 'plain_text',
-              content: '📝 始终允许此工具',
-            },
-            type: 'default',
-            value: {
-              action: 'permission_allow',
-              sessionId: data.sessionId,
-              permissionId: data.permissionId,
-              remember: true,
-            },
-          },
-        ],
+        tag: 'button',
+        text: {
+          tag: 'plain_text',
+          content: '✅ 允许',
+        },
+        type: 'primary',
+        value: {
+          action: 'permission_allow',
+          sessionId: data.sessionId,
+          permissionId: data.permissionId,
+          remember: false,
+        },
       },
       {
-        tag: 'note',
-        elements: [
-          {
-            tag: 'plain_text',
-            content: '也可以直接回复 y 或 n 来确认',
-          },
-        ],
+        tag: 'button',
+        text: {
+          tag: 'plain_text',
+          content: '❌ 拒绝',
+        },
+        type: 'danger',
+        value: {
+          action: 'permission_deny',
+          sessionId: data.sessionId,
+          permissionId: data.permissionId,
+        },
+      },
+      {
+        tag: 'button',
+        text: {
+          tag: 'plain_text',
+          content: '📝 始终允许此工具',
+        },
+        type: 'default',
+        value: {
+          action: 'permission_allow',
+          sessionId: data.sessionId,
+          permissionId: data.permissionId,
+          remember: true,
+        },
+      },
+      {
+        tag: 'markdown',
+        content: '也可以直接回复 y 或 n 来确认',
       },
     ],
+    },
   };
 }
 
@@ -174,25 +167,21 @@ export function buildStatusCard(data: StatusCardData): object {
       tag: 'hr',
     });
     elements.push({
-      tag: 'action',
-      actions: [
-        {
-          tag: 'button',
-          text: {
-            tag: 'plain_text',
-            content: '⏹️ 中断执行',
-          },
-          type: 'danger',
-          value: {
-            action: 'abort',
-            sessionId: data.sessionId,
-          },
-        },
-      ],
+      tag: 'button',
+      text: {
+        tag: 'plain_text',
+        content: '⏹️ 中断执行',
+      },
+      type: 'danger',
+      value: {
+        action: 'abort',
+        sessionId: data.sessionId,
+      },
     });
   }
 
   return {
+    schema: '2.0',
     config: {
       wide_screen_mode: true,
     },
@@ -203,7 +192,9 @@ export function buildStatusCard(data: StatusCardData): object {
       },
       template: status.color,
     },
+    body: {
     elements,
+    },
   };
 }
 
@@ -231,6 +222,7 @@ export function buildControlCard(data: ControlCardData): object {
   }));
 
   return {
+    schema: '2.0',
     config: {
       wide_screen_mode: true,
     },
@@ -241,54 +233,41 @@ export function buildControlCard(data: ControlCardData): object {
       },
       template: 'blue',
     },
+    body: {
     elements: [
       {
         tag: 'div',
         text: {
           tag: 'lark_md',
-          content: `**当前模型**: ${data.currentModel || '跟随默认'}\n**当前角色**: ${data.currentAgent || '默认角色'}\n**当前强度**: ${data.currentEffort || '默认（自动）'}（用 /effort 修改）`,
+          content: `**当前模型**: ${data.currentModel || '跟随默认'}\n**当前角色**: ${data.currentAgent || '默认角色'}\n**当前强度**: ${data.currentEffort || '默认（自动）'}（用 /effort 修改）\n> 提示：（子）角色多为子任务/委派场景；主对话一般选（主）或无「默认」。`,
         },
       },
       {
-        tag: 'action',
-        actions: [
-          {
-            tag: 'button',
-            text: { tag: 'plain_text', content: '⏹️ 停止' },
-            type: 'danger',
-            value: { action: 'stop', conversationKey: data.conversationKey, chatId: data.chatId, chatType: data.chatType },
-          },
-          {
-            tag: 'button',
-            text: { tag: 'plain_text', content: '↩️ 撤回' },
-            type: 'default',
-            value: { action: 'undo', conversationKey: data.conversationKey, chatId: data.chatId, chatType: data.chatType },
-          },
-        ],
+        tag: 'button',
+        text: { tag: 'plain_text', content: '⏹️ 停止' },
+        type: 'danger',
+        value: { action: 'stop', conversationKey: data.conversationKey, chatId: data.chatId, chatType: data.chatType },
       },
       {
-        tag: 'action',
-        actions: [
-          {
-            tag: 'select_static',
-            placeholder: { tag: 'plain_text', content: '选择模型' },
-            value: { action: 'model_select', conversationKey: data.conversationKey, chatId: data.chatId, chatType: data.chatType },
-            options: modelOptions,
-          },
-        ],
+        tag: 'button',
+        text: { tag: 'plain_text', content: '↩️ 撤回' },
+        type: 'default',
+        value: { action: 'undo', conversationKey: data.conversationKey, chatId: data.chatId, chatType: data.chatType },
       },
       {
-        tag: 'action',
-        actions: [
-          {
-            tag: 'select_static',
-            placeholder: { tag: 'plain_text', content: '选择角色' },
-            value: { action: 'agent_select', conversationKey: data.conversationKey, chatId: data.chatId, chatType: data.chatType },
-            options: agentOptions,
-          },
-        ],
+        tag: 'select_static',
+        placeholder: { tag: 'plain_text', content: '选择模型' },
+        value: { action: 'model_select', conversationKey: data.conversationKey, chatId: data.chatId, chatType: data.chatType },
+        options: modelOptions,
+      },
+      {
+        tag: 'select_static',
+        placeholder: { tag: 'plain_text', content: '选择角色' },
+        value: { action: 'agent_select', conversationKey: data.conversationKey, chatId: data.chatId, chatType: data.chatType },
+        options: agentOptions,
       },
     ],
+    },
   };
 }
 
@@ -380,36 +359,27 @@ export function buildQuestionCardV2(data: QuestionCardData): object {
     ? '多选请用逗号或空格分隔（如 A,C 或 1 3），或直接回复自定义内容；也可输入“跳过”或点击下方按钮'
     : '回复 A 或 1，或直接回复自定义内容（不匹配选项将按自定义处理）；也可输入“跳过”或点击下方按钮';
   elements.push({
-    tag: 'note',
-    elements: [
-      {
-        tag: 'plain_text',
-        content: hint,
-      },
-    ],
+    tag: 'markdown',
+    content: hint,
   });
 
   elements.push({
-    tag: 'action',
-    actions: [
-      {
-        tag: 'button',
-        text: {
-          tag: 'plain_text',
-          content: '⏭️ 跳过本题',
-        },
-        type: 'default',
-        value: {
-          action: 'question_skip',
-          requestId: data.requestId,
-          chatId: data.chatId,
-          questionIndex: safeIndex,
-        },
-      },
-    ],
+    tag: 'button',
+    text: {
+      tag: 'plain_text',
+      content: '⏭️ 跳过本题',
+    },
+    type: 'default',
+    value: {
+      action: 'question_skip',
+      requestId: data.requestId,
+      chatId: data.chatId,
+      questionIndex: safeIndex,
+    },
   });
 
   return {
+    schema: '2.0',
     config: {
       wide_screen_mode: true,
     },
@@ -420,7 +390,9 @@ export function buildQuestionCardV2(data: QuestionCardData): object {
       },
       template: 'orange',
     },
+    body: {
     elements,
+    },
   };
 }
 
@@ -433,6 +405,7 @@ export function buildQuestionAnsweredCard(answers: string[][]): object {
   });
 
   return {
+    schema: '2.0',
     config: {
       wide_screen_mode: true,
     },
@@ -443,6 +416,7 @@ export function buildQuestionAnsweredCard(answers: string[][]): object {
       },
       template: 'green',
     },
+    body: {
     elements: [
       {
         tag: 'div',
@@ -452,6 +426,7 @@ export function buildQuestionAnsweredCard(answers: string[][]): object {
         },
       },
     ],
+    },
   };
 }
 
@@ -590,13 +565,8 @@ function buildCreateChatSelectorElements(data: CreateChatCardData): object[] {
 
   noteLines.push('工作项目决定 AI 在哪份代码上工作。未选择时使用默认项目。');
   elements.push({
-    tag: 'note',
-    elements: [
-      {
-        tag: 'plain_text',
-        content: noteLines.join('\n'),
-      },
-    ],
+    tag: 'markdown',
+    content: noteLines.join('\n'),
   });
 
   return elements;
@@ -615,6 +585,7 @@ export function buildCreateChatCard(data: CreateChatCardData): object {
   ];
 
   return {
+    schema: '2.0',
     config: {
       wide_screen_mode: true,
     },
@@ -625,7 +596,9 @@ export function buildCreateChatCard(data: CreateChatCardData): object {
       },
       template: 'blue',
     },
+    body: {
     elements,
+    },
   };
 }
 
@@ -645,24 +618,20 @@ export function buildWelcomeCard(userName: string, createChatData?: CreateChatCa
     baseElements.push(...buildCreateChatSelectorElements(createChatData));
   } else {
     baseElements.push({
-      tag: 'action',
-      actions: [
-        {
-          tag: 'button',
-          text: {
-            tag: 'plain_text',
-            content: '➕ 创建新会话群',
-          },
-          type: 'primary',
-          value: {
-            action: 'create_chat',
-          },
-        },
-      ],
+      tag: 'button',
+      text: {
+        tag: 'plain_text',
+        content: '➕ 创建新会话群',
+      },
+      type: 'primary',
+      value: {
+        action: 'create_chat',
+      },
     });
   }
 
   return {
+    schema: '2.0',
     config: {
       wide_screen_mode: true,
     },
@@ -673,6 +642,8 @@ export function buildWelcomeCard(userName: string, createChatData?: CreateChatCa
       },
       template: 'blue',
     },
+    body: {
     elements: baseElements,
+    },
   };
 }

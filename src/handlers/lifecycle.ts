@@ -1,6 +1,6 @@
 import { feishuClient } from '../feishu/client.js';
 import { chatSessionStore } from '../store/chat-session.js';
-import { opencodeClient } from '../opencode/client.js';
+import { activeBackend } from '../backend/active.js';
 import { userConfig } from '../config.js';
 
 export interface CleanupStats {
@@ -31,27 +31,34 @@ export class LifecycleHandler {
       removedOrphanMappings: 0,
     };
 
-    const chats = await feishuClient.getUserChats();
-    const activeChatIdSet = new Set(chats);
-
     // 仅处理 Feishu 平台的映射
     const feishuChatIds = chatSessionStore.getChatIdsByPlatform('feishu');
 
-    if (chats.length === 0) {
-      console.log('[Lifecycle] 当前未检索到任何群聊，跳过孤儿映射清理');
-    } else {
-      for (const mappedChatId of feishuChatIds) {
-        if (activeChatIdSet.has(mappedChatId)) continue;
-        if (!chatSessionStore.isGroupChatSession(mappedChatId)) {
-          continue;
-        }
-        chatSessionStore.removeSession(mappedChatId);
-        stats.removedOrphanMappings += 1;
-        console.log(`[Lifecycle] 已移除孤儿映射: chat=${mappedChatId}`);
-      }
+    // 用 isBotInChat 逐个验证，避免 tenant_access_token 只返回主动加入的群
+    // 被拉进去的群也能被正确识别，不会误删孤儿映射
+    const activeChatIdSet = new Set<string>();
+    await Promise.all(
+      feishuChatIds.map(async (chatId) => {
+        const inChat = await feishuClient.isBotInChat(chatId);
+        if (inChat !== false) activeChatIdSet.add(chatId);
+      })
+    );
+
+    // 同时把 bot 主动加入的群也加进来（用于 checkAndDisbandIfEmpty 扫描）
+    const activeChats = await feishuClient.getUserChats();
+    for (const chatId of activeChats) {
+      activeChatIdSet.add(chatId);
     }
 
-    for (const chatId of chats) {
+    for (const mappedChatId of feishuChatIds) {
+      if (activeChatIdSet.has(mappedChatId)) continue;
+      if (!chatSessionStore.isGroupChatSession(mappedChatId)) continue;
+      chatSessionStore.removeSession(mappedChatId);
+      stats.removedOrphanMappings += 1;
+      console.log(`[Lifecycle] 已移除孤儿映射: chat=${mappedChatId}`);
+    }
+
+    for (const chatId of activeChatIdSet) {
       stats.scannedChats += 1;
       await this.checkAndDisbandIfEmpty(chatId, stats);
     }
@@ -117,7 +124,7 @@ export class LifecycleHandler {
       } else {
         // 尝试删除会话（如果 API 支持）
         try {
-          const deleted = await opencodeClient.deleteSession(sessionId);
+          const deleted = await activeBackend.deleteSession(sessionId);
           if (deleted && stats) {
             stats.deletedSessions += 1;
           }

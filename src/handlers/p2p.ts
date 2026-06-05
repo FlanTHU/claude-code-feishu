@@ -1,5 +1,5 @@
 import { feishuClient, type FeishuMessageEvent, type FeishuCardActionEvent } from '../feishu/client.js';
-import { opencodeClient } from '../opencode/client.js';
+import { activeBackend } from '../backend/active.js';
 import { chatSessionStore } from '../store/chat-session.js';
 import {
   buildCreateChatCard,
@@ -13,13 +13,14 @@ import { buildSessionTimestamp } from '../utils/session-title.js';
 import { parseCommand, getHelpText, type ParsedCommand } from '../commands/parser.js';
 import { commandHandler } from './command.js';
 import { groupHandler } from './group.js';
+import { permissionHandler } from '../permissions/handler.js';
 import { directoryConfig, userConfig } from '../config.js';
 
 interface EnsurePrivateSessionResult {
   firstBinding: boolean;
 }
 
-type OpencodeSession = Awaited<ReturnType<typeof opencodeClient.listSessions>>[number];
+type OpencodeSession = Awaited<ReturnType<typeof activeBackend.listSessions>>[number];
 
 const CREATE_CHAT_OPTION_LIMIT = 100;
 const CREATE_CHAT_EXISTING_LIMIT = CREATE_CHAT_OPTION_LIMIT - 1;
@@ -300,7 +301,7 @@ private getSessionOptionLabel(session: OpencodeSession, highlightWorkspace: bool
     const knownDirectorySet = new Set<string>(chatSessionStore.getKnownDirectories());
     if (userConfig.enableManualSessionBind) {
       try {
-        const sessions = this.sortSessionsForCreateChat(await opencodeClient.listSessionsAcrossProjects());
+        const sessions = this.sortSessionsForCreateChat(await activeBackend.listSessionsAcrossProjects());
         totalSessionCount = sessions.length;
 
         let previousDirectory = '';
@@ -395,7 +396,7 @@ private getSessionOptionLabel(session: OpencodeSession, highlightWorkspace: bool
 
   private async isSessionMissingInOpenCode(sessionId: string): Promise<boolean> {
     try {
-      const session = await opencodeClient.findSessionAcrossProjects(sessionId);
+      const session = await activeBackend.findSessionAcrossProjects(sessionId);
       return !session;
     } catch (error) {
       console.warn('[P2P] 校验会话存在性失败，保持当前绑定:', error);
@@ -422,7 +423,7 @@ private getSessionOptionLabel(session: OpencodeSession, highlightWorkspace: bool
       const chatDefault = chatSessionStore.getSession(chatId)?.defaultDirectory;
       const dirResult = DirectoryPolicy.resolve({ chatDefaultDirectory: chatDefault });
       const effectiveDir = dirResult.ok && dirResult.source !== 'server_default' ? dirResult.directory : undefined;
-      const session = await opencodeClient.createSession(sessionTitle, effectiveDir);
+      const session = await activeBackend.createSession(sessionTitle, effectiveDir);
       chatSessionStore.setSession(chatId, session.id, senderId, sessionTitle, { chatType: 'p2p', resolvedDirectory: session.directory });
       return {
         firstBinding: true,
@@ -488,8 +489,16 @@ private getSessionOptionLabel(session: OpencodeSession, highlightWorkspace: bool
       return;
     }
 
+    // 3.0 权限确认回复（y/n/always）：P2P 私聊也要能确认挂起的权限。
+    // 必须在普通命令分发之前拦截，否则会被当作未知命令透传。
+    if (command.type === 'permission') {
+      const handled = await this.handlePermissionReply(event, command);
+      if (handled) return;
+      // 无挂起权限时落回普通处理（视作普通文本）
+    }
+
     // 3. 私聊命令
-    if (command.type !== 'prompt') {
+    if (command.type !== 'prompt' && command.type !== 'permission') {
       console.log(`[P2P] 收到命令: ${command.type}`);
       await commandHandler.handle(command, {
         chatId,
@@ -503,6 +512,55 @@ private getSessionOptionLabel(session: OpencodeSession, highlightWorkspace: bool
     // 4. 私聊普通消息：按群聊同样逻辑转发到 OpenCode
     console.log(`[P2P] 收到私聊消息: user=${senderId}, content=${content.slice(0, 20)}...`);
     await groupHandler.handleMessage(event);
+  }
+
+  /**
+   * 处理私聊里的权限确认回复（y/n/always）。
+   * 返回 true 表示已作为权限响应处理（无论成功失败），false 表示当前无挂起权限，
+   * 调用方应把消息当普通文本继续处理。
+   */
+  private async handlePermissionReply(
+    event: FeishuMessageEvent,
+    command: ParsedCommand
+  ): Promise<boolean> {
+    const { chatId, messageId } = event;
+
+    const pending = permissionHandler.peekForChat(chatId);
+    if (!pending) {
+      return false;
+    }
+
+    const allow = command.permissionAllow ?? (command.permissionResponse === 'y');
+    const remember = command.permissionRemember ?? false;
+
+    const responded = await activeBackend.respondToPermission(
+      pending.sessionId,
+      pending.permissionId,
+      allow,
+      remember
+    );
+
+    if (!responded) {
+      console.error(
+        `[P2P-权限] 响应失败: chat=${chatId}, session=${pending.sessionId}, permission=${pending.permissionId}`
+      );
+      await this.safeReply(messageId, chatId, '权限响应失败，请重试');
+      return true;
+    }
+
+    permissionHandler.resolveForChat(chatId, pending.permissionId);
+    const toolName = pending.tool || '工具';
+    console.log(
+      `[P2P-权限] 响应成功: chat=${chatId}, permission=${pending.permissionId}, allow=${allow}, remember=${remember}`
+    );
+    await this.safeReply(
+      messageId,
+      chatId,
+      allow
+        ? remember ? `✅ 已允许并记住权限：${toolName}` : `✅ 已允许权限：${toolName}`
+        : `❌ 已拒绝权限：${toolName}`
+    );
+    return true;
   }
 
   private async ensureUserInGroup(
@@ -542,7 +600,7 @@ private getSessionOptionLabel(session: OpencodeSession, highlightWorkspace: bool
 
   private async findSessionById(sessionId: string): Promise<OpencodeSession | null> {
     try {
-      return await opencodeClient.findSessionAcrossProjects(sessionId);
+      return await activeBackend.findSessionAcrossProjects(sessionId);
     } catch (error) {
       console.warn('[P2P] 查询 OpenCode 会话列表失败:', error);
       return null;
@@ -614,9 +672,9 @@ private getSessionOptionLabel(session: OpencodeSession, highlightWorkspace: bool
       protectSessionDelete = true;
       targetDirectory = selectedSession.directory;
     } else {
-      let session: Awaited<ReturnType<typeof opencodeClient.createSession>> | null = null;
+      let session: Awaited<ReturnType<typeof activeBackend.createSession>> | null = null;
       try {
-        session = await opencodeClient.createSession(sessionTitle, effectiveDir);
+        session = await activeBackend.createSession(sessionTitle, effectiveDir);
       } catch (error) {
         console.error('[P2P] 创建 OpenCode 会话异常:', error);
         await feishuClient.disbandChat(newChatId);

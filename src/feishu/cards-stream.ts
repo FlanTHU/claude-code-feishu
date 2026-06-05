@@ -61,6 +61,7 @@ export interface StreamCardData {
   showThinking?: boolean;
   text: string;
   chatId?: string;
+  chatType?: 'p2p' | 'group';
   messageId?: string;
   thinkingMessageId?: string;
   tools: StreamToolState[];
@@ -68,6 +69,91 @@ export interface StreamCardData {
   pendingPermission?: StreamCardPendingPermission;
   pendingQuestion?: StreamCardPendingQuestion;
   status: 'processing' | 'completed' | 'failed';
+  elapsedSecs?: number;
+  /** 当前使用的模型，展示在卡片 header */
+  currentModel?: string;
+}
+
+/** 有序列表项模式：以数字+点开头，避免误判为多轮对话 */
+const ORDERED_LIST_ITEM_RE = /^\d+[.)]\s/;
+
+function formatMultiTurnAnswer(answer: string): string {
+  const cleaned = answer.replace(/[ \t]*<!--ctx:[^>]*-->/g, '').replace(/\n{3,}/g, '\n\n').trim();
+  const paras = cleaned.split(/\n{2,}/).map((p: string) => p.trim()).filter(Boolean);
+  if (paras.length < 2) return cleaned;
+
+  const SHORT_MAX_CHARS = 80;
+  const SHORT_MAX_LINES = 3;
+  const isShort = (p: string) => {
+    const lines = p.split('\n');
+    return lines.length <= SHORT_MAX_LINES && p.length <= SHORT_MAX_CHARS;
+  };
+
+  /** 有序列表项不参与多轮对话转换，保持原样 */
+  const isOrderedListItem = (p: string) => ORDERED_LIST_ITEM_RE.test(p);
+
+  let turnCount = 0;
+  for (let i = 0; i < paras.length - 1; i++) {
+    if (!isOrderedListItem(paras[i]) && isShort(paras[i]) && !isShort(paras[i + 1])) turnCount++;
+  }
+  if (turnCount === 0) return cleaned;
+
+  const out: string[] = [];
+  for (let i = 0; i < paras.length; i++) {
+    const p = paras[i];
+    const next = paras[i + 1];
+    if (!isOrderedListItem(p) && isShort(p) && next && !isShort(next)) {
+      if (out.length > 0) out.push('---');
+      const lines = p.split('\n');
+      lines[0] = `💬 ${lines[0]}`;
+      out.push(lines.map((l: string) => `> ${l}`).join('\n'));
+    } else {
+      out.push(p);
+    }
+  }
+  return out.join('\n\n');
+}
+
+function splitTextByBytes(text: string, maxBytes: number): string[] {
+  if (Buffer.byteLength(text, 'utf8') <= maxBytes) return [text];
+
+  const chunks: string[] = [];
+  let remaining = text;
+
+  while (remaining.length > 0) {
+    if (Buffer.byteLength(remaining, 'utf8') <= maxBytes) {
+      chunks.push(remaining);
+      break;
+    }
+
+    // Binary-search for the largest char-index whose UTF-8 byte length fits maxBytes
+    let lo = 0;
+    let hi = remaining.length;
+    while (lo < hi) {
+      const mid = (lo + hi + 1) >> 1;
+      if (Buffer.byteLength(remaining.slice(0, mid), 'utf8') <= maxBytes) {
+        lo = mid;
+      } else {
+        hi = mid - 1;
+      }
+    }
+    let splitIdx = lo;
+
+    // Try to split at paragraph boundary within the safe window
+    const windowStart = Math.floor(splitIdx * 0.3);
+    const dblNl = remaining.lastIndexOf('\n\n', splitIdx);
+    if (dblNl > windowStart) {
+      splitIdx = dblNl;
+    } else {
+      const singleNl = remaining.lastIndexOf('\n', splitIdx);
+      if (singleNl > windowStart) splitIdx = singleNl;
+    }
+
+    chunks.push(remaining.slice(0, splitIdx));
+    remaining = remaining.slice(splitIdx).replace(/^\n+/, '');
+  }
+
+  return chunks;
 }
 
 function escapeCodeBlockContent(text: string): string {
@@ -116,14 +202,15 @@ export interface StreamCardBuildOptions {
   componentBudget?: number;
 }
 
-const DEFAULT_STREAM_CARD_COMPONENT_BUDGET = 180;
-const MIN_STREAM_CARD_COMPONENT_BUDGET = 20;
-const MAX_TIMELINE_SEGMENTS = 60;
+const DEFAULT_STREAM_CARD_COMPONENT_BUDGET = 175;
+const MIN_STREAM_CARD_COMPONENT_BUDGET = 10;
+const MAX_TIMELINE_SEGMENTS = 30;
+const MAX_CARD_BODY_BYTES = 28 * 1024;
 const MAX_REASONING_SEGMENT_LENGTH = 2600;
 const MAX_TOOL_OUTPUT_LENGTH = 4000;
-const MAX_TEXT_SEGMENT_LENGTH = 5000;
+const MAX_TEXT_SEGMENT_LENGTH = 30000;
 const MAX_THINKING_PANEL_LENGTH = 2600;
-const MAX_BODY_TEXT_LENGTH = 6000;
+const MAX_BODY_TEXT_LENGTH = 30000;
 
 function isHrElement(element: object): boolean {
   const value = element as { tag?: unknown };
@@ -144,12 +231,25 @@ function countComponentTags(node: unknown): number {
   }
 
   const record = node as Record<string, unknown>;
-  let total = typeof record.tag === 'string' ? 1 : 0;
-  for (const value of Object.values(record)) {
-    total += countComponentTags(value);
+  let count = 'tag' in record ? 1 : 0;
+
+  for (const key of ['elements', 'columns', 'content', 'body']) {
+    if (key in record) {
+      count += countComponentTags(record[key]);
+    }
   }
 
-  return total;
+  if ('header' in record && record.header && typeof record.header === 'object') {
+    const header = record.header as Record<string, unknown>;
+    for (const key of ['title', 'subtitle']) {
+      if (key in header && header[key] && typeof header[key] === 'object') {
+        const child = header[key] as Record<string, unknown>;
+        if ('tag' in child) count += 1;
+      }
+    }
+  }
+
+  return count;
 }
 
 function normalizeElementPage(elements: object[]): object[] {
@@ -180,21 +280,28 @@ function paginateElementsByComponentBudget(elements: object[], componentBudget: 
   const pages: object[][] = [];
   let currentPage: object[] = [];
   let currentCount = 0;
+  let currentBytes = 0;
 
   for (const element of elements) {
     const componentCount = Math.max(1, countComponentTags(element));
+    const elementBytes = Buffer.byteLength(JSON.stringify(element), 'utf8');
 
-    if (currentPage.length > 0 && currentCount + componentCount > budgetForBody) {
+    if (currentPage.length > 0 && (
+      currentCount + componentCount > budgetForBody ||
+      currentBytes + elementBytes > MAX_CARD_BODY_BYTES
+    )) {
       const normalized = normalizeElementPage(currentPage);
       if (normalized.length > 0) {
         pages.push(normalized);
       }
       currentPage = [];
       currentCount = 0;
+      currentBytes = 0;
     }
 
     currentPage.push(element);
     currentCount += componentCount;
+    currentBytes += elementBytes;
   }
 
   const normalized = normalizeElementPage(currentPage);
@@ -209,12 +316,58 @@ function paginateElementsByComponentBudget(elements: object[], componentBudget: 
   return pages;
 }
 
+/** 判断两段文本是否实质重复（用于去重恶性重复） */
+function isSegmentDuplicate(prev: string, curr: string): boolean {
+  if (!prev || !curr) return false;
+  const p = prev.trim();
+  const c = curr.trim();
+  if (p === c) return true;
+  const minLen = Math.min(p.length, c.length);
+  const maxLen = Math.max(p.length, c.length);
+  if (minLen < 40 || maxLen < 60) return false;
+  const shorter = p.length <= c.length ? p : c;
+  const longer = p.length > c.length ? p : c;
+  // 一方是另一方的子串且重叠超过 75% 视为重复
+  return longer.includes(shorter) && minLen / maxLen >= 0.75;
+}
+
+/** 生成内容指纹，用于跨段去重（长文本取首尾+长度，短文本用全文） */
+function contentFingerprint(text: string, maxLen = 300): string {
+  const t = text.trim();
+  if (t.length <= maxLen) return t;
+  return `${t.slice(0, 150)}|${t.length}|${t.slice(-100)}`;
+}
+
+/** 段内段落去重：防止模型恶性循环时同一段落在单 segment 内反复刷屏 */
+function deduplicateRepeatedParagraphs(text: string): string {
+  const paras = text.split(/\n{2,}/).map(p => p.trim()).filter(Boolean);
+  if (paras.length < 2) return text;
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const p of paras) {
+    const fp = contentFingerprint(p);
+    if (seen.has(fp)) continue;
+    out.push(p);
+    seen.add(fp);
+  }
+  return out.join('\n\n');
+}
+
 function buildTimelineElements(
   segments: StreamCardSegment[],
   options?: { showThinking?: boolean; showTools?: boolean }
 ): object[] {
   const elements: object[] = [];
-  const visibleSegments = segments.slice(-MAX_TIMELINE_SEGMENTS);
+  const textAndReasoningSegments = segments.filter(s => s.type === 'text' || s.type === 'reasoning');
+  const otherSegments = segments.filter(s => s.type !== 'text' && s.type !== 'reasoning');
+  const trimmedOthers = otherSegments.slice(-(MAX_TIMELINE_SEGMENTS - textAndReasoningSegments.length));
+  const visibleSegments = [...textAndReasoningSegments, ...trimmedOthers].sort(
+    (a, b) => segments.indexOf(a) - segments.indexOf(b)
+  );
+
+  let lastReasoningText = '';
+  let lastTextContent = '';
+  const seenFingerprints = new Set<string>();
 
   for (const segment of visibleSegments) {
     let nextElement: object | null = null;
@@ -223,10 +376,26 @@ function buildTimelineElements(
       if (options?.showThinking === false) {
         continue;
       }
-      const text = segment.text.trim();
+      const rawText = segment.text.trim();
+      if (!rawText) {
+        continue;
+      }
+      // 段内段落去重：防止单 segment 内恶性循环刷屏
+      const text = deduplicateRepeatedParagraphs(rawText);
       if (!text) {
         continue;
       }
+      // 去重：跳过与上一段 reasoning 实质重复的内容
+      if (isSegmentDuplicate(lastReasoningText, text)) {
+        continue;
+      }
+      // 跨段去重：若指纹已出现过则跳过（恶性循环时同一内容会反复出现）
+      const fp = contentFingerprint(text);
+      if (seenFingerprints.has(fp)) {
+        continue;
+      }
+      seenFingerprints.add(fp);
+      lastReasoningText = text;
 
       const rendered = truncateMiddleText(text, MAX_REASONING_SEGMENT_LENGTH);
       nextElement = {
@@ -286,11 +455,37 @@ function buildTimelineElements(
       if (!segment.text.trim()) {
         continue;
       }
-      const text = truncateMiddleText(segment.text, MAX_TEXT_SEGMENT_LENGTH);
-      nextElement = {
-        tag: 'markdown',
-        content: text,
-      };
+      // 段内段落去重：防止单 segment 内恶性循环刷屏
+      const text = deduplicateRepeatedParagraphs(segment.text.trim());
+      if (!text) {
+        continue;
+      }
+      // 去重：跳过与上一段 text 实质重复的内容
+      if (isSegmentDuplicate(lastTextContent, text)) {
+        continue;
+      }
+      // 跨段去重：若指纹已出现过则跳过
+      const fp = contentFingerprint(text);
+      if (seenFingerprints.has(fp)) {
+        continue;
+      }
+      seenFingerprints.add(fp);
+      lastTextContent = text;
+
+      const formattedSegText = formatMultiTurnAnswer(text);
+      const MARKDOWN_BYTE_LIMIT = 26 * 1024;
+      const segChunks = splitTextByBytes(formattedSegText, MARKDOWN_BYTE_LIMIT);
+      if (segChunks.length === 0) continue;
+      nextElement = { tag: 'markdown', content: segChunks[0] };
+      if (segChunks.length > 1) {
+        if (elements.length > 0) elements.push({ tag: 'hr' });
+        elements.push(nextElement);
+        for (let ci = 1; ci < segChunks.length; ci++) {
+          elements.push({ tag: 'hr' });
+          elements.push({ tag: 'markdown', content: segChunks[ci] });
+        }
+        nextElement = null;
+      }
     } else if (segment.type === 'note') {
       const text = segment.text.trim();
       if (!text) {
@@ -408,23 +603,37 @@ function buildStreamCardElements(
   options?: { showThinking?: boolean; showTools?: boolean }
 ): object[] {
   const elements: object[] = [];
+
+  if (data.currentModel && data.status !== 'completed') {
+    elements.push({
+      tag: 'markdown',
+      content: `**模型:** ${data.currentModel}`,
+    });
+  }
+
   const thinkingText = data.thinking.trim();
 
+  // 群聊强制隐藏 thinking/tools，不依赖 session 推断，确保生效
+  const forceHideForGroup = data.chatType === 'group';
+  const effectiveShowThinking = forceHideForGroup ? false : (options?.showThinking ?? true);
+  const effectiveShowTools = forceHideForGroup ? false : (options?.showTools ?? true);
+
   const timelineElements = Array.isArray(data.segments) && data.segments.length > 0
-    ? buildTimelineElements(data.segments, { showThinking: options?.showThinking, showTools: options?.showTools })
+    ? buildTimelineElements(data.segments, { showThinking: effectiveShowThinking, showTools: effectiveShowTools })
     : [];
 
   if (timelineElements.length > 0) {
     elements.push(...timelineElements);
   }
 
-  const showThinking = options?.showThinking ?? true;
-  const showTools = options?.showTools ?? true;
+  const showThinking = effectiveShowThinking;
+  const showTools = effectiveShowTools;
 
   if (timelineElements.length === 0) {
     // 1. 思考过程（原生折叠面板）
     if (thinkingText && showThinking) {
-      const renderedThinking = truncateMiddleText(thinkingText, MAX_THINKING_PANEL_LENGTH);
+      const dedupedThinking = deduplicateRepeatedParagraphs(thinkingText);
+      const renderedThinking = truncateMiddleText(dedupedThinking, MAX_THINKING_PANEL_LENGTH);
       elements.push({
         tag: 'collapsible_panel',
         expanded: false,
@@ -470,10 +679,14 @@ function buildStreamCardElements(
       if (elements.length > 0) {
         elements.push({ tag: 'hr' });
       }
-      elements.push({
-        tag: 'markdown',
-        content: truncateMiddleText(data.text, MAX_BODY_TEXT_LENGTH),
-      });
+      const dedupedText = deduplicateRepeatedParagraphs(data.text);
+      const formattedText = formatMultiTurnAnswer(dedupedText);
+      const MARKDOWN_BYTE_LIMIT = 26 * 1024;
+      const textChunks = splitTextByBytes(formattedText, MARKDOWN_BYTE_LIMIT);
+      for (let ci = 0; ci < textChunks.length; ci++) {
+        if (ci > 0) elements.push({ tag: 'hr' });
+        elements.push({ tag: 'markdown', content: textChunks[ci] });
+      }
     } else if (data.status === 'processing') {
       if (elements.length > 0) {
         elements.push({ tag: 'hr' });
@@ -519,46 +732,104 @@ function buildStreamCardElements(
 function buildStreamCardPayload(
   elements: object[],
   statusText: string,
-  statusColor: 'blue' | 'green' | 'red'
+  statusColor: 'blue' | 'green' | 'red',
+  data?: StreamCardData
 ): object {
   const normalizedElements = elements.length > 0
     ? elements
     : [{ tag: 'markdown', content: '（无输出）' }];
 
+  const subtitleParts: string[] = [];
+  if (data?.currentModel) {
+    subtitleParts.push(`🤖 ${data.currentModel}`);
+  }
+  if (data?.elapsedSecs) {
+    subtitleParts.push(`⏱️ ${formatElapsed(data.elapsedSecs)}`);
+  }
+  if (data?.tools && data.tools.length > 0) {
+    const completedTools = data.tools.filter(t => t.status === 'completed').length;
+    subtitleParts.push(`🔧 ${completedTools}/${data.tools.length} 工具`);
+  }
+  const headerSubtitle = subtitleParts.length > 0
+    ? { tag: 'plain_text', content: subtitleParts.join('  ·  ') }
+    : undefined;
+
+  const bodyElements: object[] = [...normalizedElements];
+
+  if (statusColor === 'green' && data?.status === 'completed' && data.messageId) {
+    bodyElements.push({ tag: 'hr' });
+    bodyElements.push({
+      tag: 'markdown',
+      content: `<font color="grey">已完成${data.elapsedSecs ? `  ·  耗时 ${formatElapsed(data.elapsedSecs)}` : ''}  ·  ${data.messageId.slice(0, 24)}...</font>`,
+    });
+  }
+
+  const isCompleted = statusColor === 'green' && data?.status === 'completed';
+  const processingStatusSummary = statusColor === 'blue' ? '⏳ 生成中...' : isCompleted ? '✅ 已完成' : '❌ 执行失败';
+
   return {
     schema: '2.0',
     config: {
-      wide_screen_mode: true,
+      update_multi: true,
+      width_mode: 'full',
+      summary: { content: processingStatusSummary },
     },
     header: {
-      title: {
-        tag: 'plain_text',
-        content: statusText,
-      },
+      title: { tag: 'plain_text', content: statusText },
+      ...(headerSubtitle ? { subtitle: headerSubtitle } : {}),
       template: statusColor,
+      padding: '12px 12px 12px 12px',
     },
     body: {
-      elements: normalizedElements,
+      direction: 'vertical',
+      padding: '12px 12px 12px 12px',
+      vertical_spacing: '8px',
+      elements: bodyElements,
     },
   };
 }
 
-function getFeishuVisibilityOptions(): { showThinking: boolean; showTools: boolean } {
+function getFeishuVisibilityOptions(chatType?: 'p2p' | 'group'): { showThinking: boolean; showTools: boolean } {
+  if (chatType === 'group') {
+    return { showThinking: false, showTools: false };
+  }
   return {
     showThinking: outputConfig.feishu.showThinkingChain,
     showTools: outputConfig.feishu.showToolChain,
   };
 }
 
+function formatElapsed(secs: number): string {
+  if (secs < 60) return `${secs}s`;
+  const m = Math.floor(secs / 60);
+  const s = secs % 60;
+  return s > 0 ? `${m}m${s}s` : `${m}m`;
+}
+
 export function buildStreamCards(data: StreamCardData, options?: StreamCardBuildOptions): object[] {
-  const visibilityOptions = getFeishuVisibilityOptions();
+  const visibilityOptions = getFeishuVisibilityOptions(data.chatType);
   const allElements = buildStreamCardElements(data, visibilityOptions);
   const statusColor: 'blue' | 'green' | 'red' = data.status === 'processing'
     ? 'blue'
     : data.status === 'completed'
       ? 'green'
       : 'red';
-  const baseStatusText = data.status === 'processing' ? '处理中...' : data.status === 'completed' ? '已完成' : '失败';
+  let baseStatusText: string;
+  if (data.status === 'processing') {
+    const runningSegment = data.segments
+      ?.slice().reverse()
+      .find(s => s.type === 'tool' && (s.status === 'running' || s.status === 'pending')) as
+      ({ type: 'tool'; name: string; status: string } | undefined);
+    const activityHint = runningSegment ? ` · 🔧 ${runningSegment.name}` : '';
+    baseStatusText = data.elapsedSecs && data.elapsedSecs >= 60
+      ? `处理中... (已等待 ${formatElapsed(data.elapsedSecs)})${activityHint}`
+      : `处理中...${activityHint}`;
+  } else {
+    baseStatusText = data.status === 'completed' ? '已完成' : '失败';
+  }
+  if (data.currentModel && data.status !== 'completed') {
+    baseStatusText = `${baseStatusText} · 模型: ${data.currentModel}`;
+  }
 
   const componentBudget = typeof options?.componentBudget === 'number' && Number.isFinite(options.componentBudget)
     ? Math.floor(options.componentBudget)
@@ -566,12 +837,12 @@ export function buildStreamCards(data: StreamCardData, options?: StreamCardBuild
   const pages = paginateElementsByComponentBudget(allElements, componentBudget);
 
   if (pages.length <= 1) {
-    return [buildStreamCardPayload(pages[0], baseStatusText, statusColor)];
+    return [buildStreamCardPayload(pages[0], baseStatusText, statusColor, data)];
   }
 
   return pages.map((pageElements, index) => {
     const statusText = `${baseStatusText}（${index + 1}/${pages.length}）`;
-    return buildStreamCardPayload(pageElements, statusText, statusColor);
+    return buildStreamCardPayload(pageElements, statusText, statusColor, data);
   });
 }
 

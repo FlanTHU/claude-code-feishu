@@ -99,6 +99,7 @@ const FILE_TYPE_MAP: Record<string, FeishuFileType> = {
 export interface SendFileRequest {
   filePath: string;
   chatId: string;
+  bypassPathCheck?: boolean;
 }
 
 export interface SendFileResult {
@@ -122,17 +123,27 @@ function getFeishuFileType(ext: string): FeishuFileType {
 
 // 发送文件到飞书群聊
 export async function sendFileToFeishu(request: SendFileRequest): Promise<SendFileResult> {
-  const { filePath, chatId } = request;
+  const { filePath, chatId, bypassPathCheck = false } = request;
 
-  // 1. 路径标准化（统一 resolve，后续所有操作均基于 resolvedPath）
   const resolvedPath = path.resolve(filePath);
   const fileName = path.basename(resolvedPath);
   const ext = path.extname(resolvedPath).toLowerCase();
 
-  // 2. 安全校验（优先于 IO 操作，避免通过文件不存在报错来探测系统文件）
-  const validation = validateFilePath(resolvedPath);
-  if (!validation.safe) {
-    return { success: false, error: validation.reason, fileName };
+  if (!bypassPathCheck) {
+    const validation = validateFilePath(resolvedPath);
+    if (!validation.safe) {
+      return { success: false, error: validation.reason, fileName };
+    }
+  } else {
+    const basename = path.basename(resolvedPath);
+    if (SENSITIVE_EXACT_NAMES.has(basename)) {
+      return { success: false, error: `拒绝发送敏感文件: ${basename}`, fileName };
+    }
+    for (const pattern of SENSITIVE_NAME_PATTERNS) {
+      if (pattern.test(basename)) {
+        return { success: false, error: `拒绝发送敏感文件: ${basename}`, fileName };
+      }
+    }
   }
 
   // 3. 存在性检查（错误信息只显示文件名，不暴露服务器完整路径）

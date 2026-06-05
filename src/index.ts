@@ -1,7 +1,8 @@
 import { feishuClient, type FeishuMessageEvent } from './feishu/client.js';
 import { feishuAdapter } from './platform/adapters/feishu-adapter.js';
 import { discordAdapter } from './platform/adapters/discord-adapter.js';
-import { opencodeClient, type PermissionRequestEvent } from './opencode/client.js';
+import { type PermissionRequestEvent } from './opencode/client.js';
+import { activeBackend, activeBackendId } from './backend/active.js';
 import { outputBuffer } from './opencode/output-buffer.js';
 import { delayedResponseHandler } from './opencode/delayed-handler.js';
 import { questionHandler } from './opencode/question-handler.js';
@@ -13,7 +14,7 @@ import { lifecycleHandler } from './handlers/lifecycle.js';
 import { createDiscordHandler } from './handlers/discord.js';
 import { commandHandler } from './handlers/command.js';
 import { cardActionHandler } from './handlers/card-action.js';
-import { validateConfig, routerConfig, outputConfig } from './config.js';
+import { validateConfig, routerConfig, outputConfig, modelConfig, claudeConfig } from './config.js';
 import { rootRouter } from './router/root-router.js';
 import {
   createPermissionActionCallbacks,
@@ -21,12 +22,14 @@ import {
 } from './router/action-handlers.js';
 import { openCodeEventHub } from './router/opencode-event-hub.js';
 import {
-  buildStreamCards,
+  buildStreamCard,
   type StreamCardData,
   type StreamCardSegment,
   type StreamCardPendingPermission,
   type StreamCardPendingQuestion,
 } from './feishu/cards-stream.js';
+import { startLocalApiServer, stopLocalApiServer } from './api/local-api.js';
+import { pickCompletionReaction } from './utils/reaction-picker.js';
 
 async function main() {
 
@@ -54,10 +57,15 @@ async function main() {
     console.log(`[Config] 📝 如需回滚到旧版路由，设置 ROUTER_MODE=legacy 并重启服务`);
   }
 
-  // 2. 连接 OpenCode
-  const connected = await opencodeClient.connect();
+  // 2. 连接 AI 后端
+  console.log(`[Config] AI 后端: ${activeBackendId}`);
+  const connected = await activeBackend.connect();
   if (!connected) {
-    console.error('无法连接到OpenCode服务器，请确保 opencode serve 已运行');
+    if (activeBackendId === 'claude') {
+      console.error('无法初始化 Claude 后端，请检查 ANTHROPIC_API_KEY / ANTHROPIC_BASE_URL');
+    } else {
+      console.error('无法连接到OpenCode服务器，请确保 opencode serve 已运行');
+    }
     process.exit(1);
   }
 
@@ -68,7 +76,7 @@ async function main() {
   const retryNoticeMap = new Map<string, string>();
   const errorNoticeMap = new Map<string, string>();
   const streamCardMessageIdsMap = new Map<string, string[]>();
-  const STREAM_CARD_COMPONENT_BUDGET = 180;
+  const STREAM_CARD_COMPONENT_BUDGET = 175;
   const CORRELATION_CACHE_TTL_MS = 10 * 60 * 1000;
 
   type CorrelationChatRef = {
@@ -144,11 +152,22 @@ async function main() {
 
   const trimTimeline = (timeline: StreamTimelineState): void => {
     const limit = 80;
+    if (timeline.order.length <= limit) return;
+    const toRemove: string[] = [];
+    for (const key of timeline.order) {
+      const seg = timeline.segments.get(key);
+      if (seg && (seg.type === 'tool' || seg.type === 'note')) {
+        toRemove.push(key);
+        if (timeline.order.length - toRemove.length <= limit) break;
+      }
+    }
+    for (const key of toRemove) {
+      timeline.order.splice(timeline.order.indexOf(key), 1);
+      timeline.segments.delete(key);
+    }
     while (timeline.order.length > limit) {
       const removedKey = timeline.order.shift();
-      if (removedKey) {
-        timeline.segments.delete(removedKey);
-      }
+      if (removedKey) timeline.segments.delete(removedKey);
     }
   };
 
@@ -531,17 +550,23 @@ async function main() {
     minValues?: number;
     maxValues?: number;
   }> } => {
-    // 根据平台读取可见性配置
-    const showThinkingChain = platform === 'discord'
-      ? outputConfig.discord.showThinkingChain
-      : platform === 'feishu'
-        ? outputConfig.feishu.showThinkingChain
-        : outputConfig.showThinkingChain;
-    const showToolChain = platform === 'discord'
-      ? outputConfig.discord.showToolChain
-      : platform === 'feishu'
-        ? outputConfig.feishu.showToolChain
-        : outputConfig.showToolChain;
+    // 根据平台和聊天类型读取可见性配置
+    // 群聊强制隐藏 thinking 和 tools
+    const isGroupChat = data.chatType === 'group';
+    const showThinkingChain = isGroupChat ? false : (
+      platform === 'discord'
+        ? outputConfig.discord.showThinkingChain
+        : platform === 'feishu'
+          ? outputConfig.feishu.showThinkingChain
+          : outputConfig.showThinkingChain
+    );
+    const showToolChain = isGroupChat ? false : (
+      platform === 'discord'
+        ? outputConfig.discord.showToolChain
+        : platform === 'feishu'
+          ? outputConfig.feishu.showToolChain
+          : outputConfig.showToolChain
+    );
 
     // 过滤 segments，移除 tool 和 reasoning 类型（当对应开关关闭时）
     const filteredSegments = showToolChain && showThinkingChain
@@ -802,6 +827,10 @@ async function main() {
         outputBuffer.append(bufferKey, deltaText);
       }
     } else if (current !== prev) {
+      // 若 prev 更长且以 current 开头，说明收到乱序的旧快照，跳过避免重复
+      if (prev.length > 0 && prev.startsWith(current) && current.length < prev.length) {
+        return;
+      }
       outputBuffer.append(bufferKey, current);
     }
     textSnapshotMap.set(key, current);
@@ -812,7 +841,8 @@ async function main() {
     if (typeof part.text !== 'string') return;
     if (typeof part.id !== 'string' || !part.id) {
       outputBuffer.appendThinking(bufferKey, part.text);
-      appendTimelineText(bufferKey, `reasoning:${sessionID}:anonymous`, 'reasoning', part.text);
+      // 使用 setTimelineText 而不是 appendTimelineText，避免增量更新导致重复
+      setTimelineText(bufferKey, `reasoning:${sessionID}:anonymous`, 'reasoning', part.text);
       return;
     }
 
@@ -825,6 +855,10 @@ async function main() {
         outputBuffer.appendThinking(bufferKey, deltaText);
       }
     } else if (current !== prev) {
+      // 若 prev 更长且以 current 开头，说明收到乱序的旧快照，跳过避免重复
+      if (prev.length > 0 && prev.startsWith(current) && current.length < prev.length) {
+        return;
+      }
       outputBuffer.appendThinking(bufferKey, current);
     }
     reasoningSnapshotMap.set(key, current);
@@ -884,6 +918,11 @@ async function main() {
     }
 
     const generic = typeof data.message === 'string' ? data.message : '';
+
+    if (generic.includes('text part') && generic.includes('not found')) {
+      return '模型流异常（stream 乱序），请重试';
+    }
+
     return generic ? `${name}：${generic}` : `${name}`;
   };
 
@@ -1016,7 +1055,7 @@ async function main() {
       return true;
     }
 
-    const responded = await opencodeClient.respondToPermission(
+    const responded = await activeBackend.respondToPermission(
       pending.sessionId,
       pending.permissionId,
       decision.allow,
@@ -1059,6 +1098,11 @@ async function main() {
   };
 
   outputBuffer.setUpdateCallback(async (buffer) => {
+    // Capture status at callback entry to prevent race condition:
+    // if status changes from 'running' to 'completed' during async card send,
+    // we must NOT run cleanup in a timer-triggered update — the completion
+    // update will be handled by the dirty-retrigger in triggerUpdate's finally block.
+    const statusAtStart = buffer.status;
     const { text, thinking } = outputBuffer.getAndClear(buffer.key);
     const timelineSegments = getTimelineSegments(buffer.key);
     const sessionConversation = resolveSessionConversation(buffer.sessionId);
@@ -1075,14 +1119,14 @@ async function main() {
       buffer.tools.length === 0 &&
       !pendingPermission &&
       !pendingQuestion &&
-      buffer.status === 'running'
+      statusAtStart === 'running'
     ) return;
 
     const current = streamContentMap.get(buffer.key) || { text: '', thinking: '' };
     current.text += text;
     current.thinking += thinking;
 
-    if (buffer.status !== 'running') {
+    if (statusAtStart !== 'running') {
       if (buffer.finalText) {
         current.text = buffer.finalText;
       }
@@ -1101,12 +1145,15 @@ async function main() {
       Boolean(pendingPermission) ||
       Boolean(pendingQuestion);
 
-    if (!hasVisibleContent && buffer.status === 'running') return;
+    if (!hasVisibleContent && statusAtStart === 'running') return;
 
+    const effectiveStatus = (statusAtStart === 'failed' || statusAtStart === 'aborted') && hasVisibleContent
+      ? 'completed'
+      : statusAtStart;
     const status: StreamCardData['status'] =
-      buffer.status === 'failed' || buffer.status === 'aborted'
+      effectiveStatus === 'failed' || effectiveStatus === 'aborted'
         ? 'failed'
-        : buffer.status === 'completed'
+        : effectiveStatus === 'completed'
           ? 'completed'
           : 'processing';
 
@@ -1114,11 +1161,60 @@ async function main() {
     if (existingMessageIds.length === 0 && buffer.messageId) {
       existingMessageIds = [buffer.messageId];
     }
+    if (statusAtStart !== 'running') {
+      console.log(`[Index] terminal callback: status=${statusAtStart}→${effectiveStatus}, existingIds=${existingMessageIds.length}, text.len=${current.text.length}, segments=${timelineSegments.length}, tools=${buffer.tools.length}`);
+    }
 
+    // 如果内容为空且已有现存卡片（之前已发出过内容），跳过本次更新
+    // 防止 session.completed 事件触发空卡片覆盖（显示"（无输出）"）
+    if (!hasVisibleContent && existingMessageIds.length > 0) return;
+
+    const isGroup = chatSessionStore.isGroupChatSession(conversationId);
+    const chatTypeForCard = isGroup ? 'group' : 'p2p';
+    // DEBUG: 群聊检测调试（thinking 内容时打印）
+    if (current.thinking.length > 0) {
+      const session = chatSessionStore.getSession(conversationId);
+      const sessionByChatId = chatSessionStore.getSession(buffer.chatId);
+      const sessionIdFromChatId = chatSessionStore.getSessionId(buffer.chatId);
+      const sessionIdFromConvId = chatSessionStore.getSessionId(conversationId);
+      console.log(`[GROUP-DEBUG] buffer.key=${buffer.key}, conv=${conversationId.slice(-12)}, buffer.chatId=${buffer.chatId.slice(-12)}, isGroup=${isGroup}, chatType=${chatTypeForCard}, session.chatType=${session?.chatType}, session.title=${session?.title}, sessionByChatId.chatType=${sessionByChatId?.chatType}, sessionIdFromChatId=${sessionIdFromChatId}, sessionIdFromConvId=${sessionIdFromConvId}, thinking.len=${current.thinking.length}`);
+    }
+
+    // Group chat 屏蔽 tool/thinking，需单独判断过滤后是否有可见内容
+    // 若只有工具调用，group chat 下会被过滤为空，此时用兜底文本
+    const hasVisibleAfterFilter = chatTypeForCard === 'group'
+      ? (
+        current.text.trim().length > 0 ||
+        timelineSegments.some(s => s.type === 'note') ||
+        Boolean(pendingPermission) ||
+        Boolean(pendingQuestion)
+      )
+      : hasVisibleContent;
+
+    if (!hasVisibleAfterFilter && existingMessageIds.length > 0 && statusAtStart === 'running') return;
+
+    if (!hasVisibleAfterFilter && existingMessageIds.length === 0 && statusAtStart === 'running') return;
+
+    let effectiveText = current.text;
+    if (!hasVisibleAfterFilter && status !== 'processing') {
+      effectiveText = status === 'completed' ? '✅ 已完成' : '❌ 执行失败';
+    }
+
+    const sessionForCard = chatSessionStore.getSession(conversationId);
+    // Claude 后端忽略 session 里的 opencode 模型偏好,实际用 claudeConfig.model,
+    // 卡片应显示真实模型而非脱节的偏好值(E2E 实测发现的显示 bug)。
+    const displayModel =
+      activeBackendId === 'claude'
+        ? claudeConfig.model || '默认'
+        : sessionForCard?.preferredModel ||
+          (modelConfig.defaultProvider && modelConfig.defaultModel
+            ? `${modelConfig.defaultProvider}:${modelConfig.defaultModel}`
+            : '默认');
     const cardData: StreamCardData = {
-      text: current.text,
+      text: effectiveText,
       thinking: current.thinking,
       chatId: conversationId,
+      chatType: chatTypeForCard,
       messageId: existingMessageIds[0] || undefined,
       tools: [...buffer.tools],
       segments: timelineSegments,
@@ -1126,6 +1222,7 @@ async function main() {
       ...(pendingQuestion ? { pendingQuestion } : {}),
       status,
       showThinking: false,
+      currentModel: displayModel,
     };
 
     if (platform !== 'feishu') {
@@ -1167,26 +1264,23 @@ async function main() {
         streamCardMessageIdsMap.delete(buffer.key);
       }
 
-      if (buffer.status !== 'running') {
+      if (statusAtStart !== 'running') {
         streamContentMap.delete(buffer.key);
         streamToolStateMap.delete(buffer.key);
         streamTimelineMap.delete(buffer.key);
         streamCardMessageIdsMap.delete(buffer.key);
         clearPartSnapshotsForSession(buffer.sessionId);
         outputBuffer.clear(buffer.key);
+      } else if (buffer.status !== 'running') {
+        console.log(`[Index] race-condition guard (portable): statusAtStart=running but buffer.status=${buffer.status} — deferring cleanup to retry (key=${buffer.key})`);
       }
       return;
     }
 
-    const cards = buildStreamCards(
-      {
-        ...cardData,
-        messageId: existingMessageIds[0] || undefined,
-      },
-      {
-        componentBudget: STREAM_CARD_COMPONENT_BUDGET,
-      }
-    );
+    const cards = [buildStreamCard({
+      ...cardData,
+      messageId: existingMessageIds[0] || undefined,
+    })];
 
     const nextMessageIds: string[] = [];
 
@@ -1226,6 +1320,10 @@ async function main() {
       void sender.deleteMessage(redundantMessageId).catch(() => undefined);
     }
 
+    if (nextMessageIds.length > 1) {
+      console.error(`[Index] invariant violated: multiple card message IDs (${nextMessageIds.length}) for key=${buffer.key} — expected single card`);
+    }
+
     if (nextMessageIds.length > 0) {
       outputBuffer.setMessageId(buffer.key, nextMessageIds[0]);
       streamCardMessageIdsMap.set(buffer.key, nextMessageIds);
@@ -1245,13 +1343,22 @@ async function main() {
       buffer.openCodeMsgId
     );
 
-    if (buffer.status !== 'running') {
+    if (statusAtStart !== 'running') {
+      const reactionStatus = statusAtStart === 'failed' || statusAtStart === 'aborted' ? 'failed' : 'completed';
+      const reactionText = buffer.finalText || current.text || '';
+      const completionEmoji = pickCompletionReaction(reactionStatus, reactionText);
+      // 群聊和私聊都会添加 Typing，完成时统一替换为完成 reaction；buffer.key 用于 userMessageIdByBufferKey 兜底
+      void groupHandler.removeTypingAndAddCompletionReaction(buffer.chatId, completionEmoji, conversationId, buffer.replyMessageId, buffer.key);
+      groupHandler.cancelSilenceTimer(conversationId);
+      console.log(`[Index] completed cleanup: key=${buffer.key}, nextIds=${nextMessageIds.length}, status=${statusAtStart}`);
       streamContentMap.delete(buffer.key);
       streamToolStateMap.delete(buffer.key);
       streamTimelineMap.delete(buffer.key);
       streamCardMessageIdsMap.delete(buffer.key);
       clearPartSnapshotsForSession(buffer.sessionId);
       outputBuffer.clear(buffer.key);
+    } else if (buffer.status !== 'running') {
+      console.log(`[Index] race-condition guard: statusAtStart=running but buffer.status=${buffer.status} — deferring cleanup to retry (key=${buffer.key})`);
     }
   });
 
@@ -1284,7 +1391,10 @@ async function main() {
   // 6.5 注入事件处理上下文到 OpenCode Event Hub（必须在所有辅助函数声明之后）
   const applyFailureToSession = async (sessionID: string, errorText: string): Promise<void> => {
     const conversation = resolveSessionConversation(sessionID);
-    if (!conversation) return;
+    if (!conversation) {
+      console.warn(`[Index] applyFailureToSession 无法解析会话: sessionID=${sessionID?.slice(0, 12)}...`);
+      return;
+    }
     const platform = conversation.platform;
     const conversationId = conversation.conversationId;
 
@@ -1366,13 +1476,24 @@ async function main() {
   });
   
   feishuClient.onMessageRecalled(async (event) => {
-    // 处理撤回
-    // event.message_id, event.chat_id
-    // 如果撤回的消息是该会话最后一条 User Message，则触发 Undo
     const chatId = event.chat_id;
     const recalledMsgId = event.message_id;
     
     if (chatId && recalledMsgId) {
+       const interaction = chatSessionStore.findInteractionByUserMsgId(chatId, recalledMsgId);
+       
+       if (interaction && interaction.botFeishuMsgIds.length > 0) {
+          console.log(`[Index] 检测到用户撤回消息: ${recalledMsgId}, 正在撤回 ${interaction.botFeishuMsgIds.length} 条bot回复`);
+          for (const botMsgId of interaction.botFeishuMsgIds) {
+             try {
+                await feishuClient.deleteMessage(botMsgId);
+                console.log(`[Index] 已撤回bot回复: ${botMsgId}`);
+             } catch (error) {
+                console.error(`[Index] 撤回bot回复失败: ${botMsgId}`, error);
+             }
+          }
+       }
+       
        const session = chatSessionStore.getSession(chatId);
        if (session && session.lastFeishuUserMsgId === recalledMsgId) {
           console.log(`[Index] 检测到用户撤回最后一条消息: ${recalledMsgId}`);
@@ -1394,34 +1515,62 @@ async function main() {
   // 9. 启动清理检查
   await lifecycleHandler.cleanUpOnStart();
 
+  // 10. 启动本地 API 服务
+  startLocalApiServer();
+
+  // 10.5 连接状态定期日志（每 5 分钟）+ correlation map 过期清理
+  setInterval(() => {
+    const feishu = feishuClient.getConnectionStatus();
+    const opencode = activeBackend.getConnectionStatus();
+    const feishuAgo = feishu.lastMessageAt ? Math.round((Date.now() - feishu.lastMessageAt) / 1000) : -1;
+    const opencodeAgo = opencode.lastHeartbeatAt ? Math.round((Date.now() - opencode.lastHeartbeatAt) / 1000) : -1;
+    console.log(
+      `[Status] 飞书=${feishu.connected ? 'ok' : 'disconnected'} (最后消息 ${feishuAgo}s 前) ` +
+        `${activeBackendId}=${opencode.connected ? 'ok' : 'disconnected'} (最后心跳 ${opencodeAgo}s 前)`
+    );
+
+    const now = Date.now();
+    for (const [k, v] of toolCallChatMap) {
+      if (v.expiresAt <= now) toolCallChatMap.delete(k);
+    }
+    for (const [k, v] of messageChatMap) {
+      if (v.expiresAt <= now) messageChatMap.delete(k);
+    }
+
+    for (const k of streamTimelineMap.keys()) {
+      if (!outputBuffer.get(k)) {
+        streamTimelineMap.delete(k);
+        streamContentMap.delete(k);
+        streamToolStateMap.delete(k);
+        streamCardMessageIdsMap.delete(k);
+      }
+    }
+  }, 5 * 60 * 1000);
+
   console.log('✅ 服务已就绪');
   
   // 优雅退出处理
   const gracefulShutdown = (signal: string) => {
     console.log(`\n[${signal}] 正在关闭服务...`);
 
-    // 停止 Discord 适配器
     try {
       discordAdapter.stop();
     } catch (e) {
       console.error('停止 Discord 适配器失败:', e);
     }
 
-    // 停止飞书连接
     try {
       feishuClient.stop();
     } catch (e) {
       console.error('停止飞书连接失败:', e);
     }
 
-    // 断开 OpenCode 连接
     try {
-      opencodeClient.disconnect();
+      activeBackend.disconnect();
     } catch (e) {
-      console.error('断开 OpenCode 失败:', e);
+      console.error('断开 AI 后端失败:', e);
     }
 
-    // 清理所有缓冲区和定时器
     try {
       outputBuffer.clearAll();
       delayedResponseHandler.cleanupExpired(0);
@@ -1430,11 +1579,10 @@ async function main() {
       console.error('清理资源失败:', e);
     }
 
-    // 延迟退出以确保所有清理完成
-    setTimeout(() => {
+    stopLocalApiServer().finally(() => {
       console.log('✅ 服务已安全关闭');
       process.exit(0);
-    }, 500);
+    });
   };
 
   process.on('SIGINT', () => gracefulShutdown('SIGINT'));

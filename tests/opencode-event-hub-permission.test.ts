@@ -1,6 +1,8 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { PermissionRequestEvent } from '../src/opencode/client.js';
-import { opencodeClient } from '../src/opencode/client.js';
+// hub 通过 injectedDependencies 把 opencodeClient 映射为 activeBackend（见 opencode-event-hub.ts:66），
+// 因此权限放行实际调用的是 activeBackend，测试需 spy 它而非 opencode 模块单例。
+import { activeBackend } from '../src/backend/active.js';
 import { permissionHandler } from '../src/permissions/handler.js';
 import { chatSessionStore } from '../src/store/chat-session.js';
 import { outputBuffer } from '../src/opencode/output-buffer.js';
@@ -73,7 +75,7 @@ describe('OpenCodeEventHub permission auto-allow fallback', () => {
     hub.setContext(createContext(() => ({ chatId: 'conv-1', source: 'session' }), upsertTimelineNote));
 
     vi.spyOn(permissionHandler, 'isToolWhitelisted').mockReturnValue(true);
-    vi.spyOn(opencodeClient, 'respondToPermission')
+    vi.spyOn(activeBackend, 'respondToPermission')
       .mockResolvedValueOnce(false)
       .mockResolvedValueOnce(true);
     vi.spyOn(chatSessionStore, 'rememberSessionAlias').mockImplementation(() => undefined);
@@ -93,7 +95,7 @@ describe('OpenCodeEventHub permission auto-allow fallback', () => {
       description: 'read file',
     });
 
-    expect(opencodeClient.respondToPermission).toHaveBeenNthCalledWith(
+    expect(activeBackend.respondToPermission).toHaveBeenNthCalledWith(
       1,
       'ses-main',
       'per-1',
@@ -101,7 +103,7 @@ describe('OpenCodeEventHub permission auto-allow fallback', () => {
       false,
       expect.any(Object)
     );
-    expect(opencodeClient.respondToPermission).toHaveBeenNthCalledWith(
+    expect(activeBackend.respondToPermission).toHaveBeenNthCalledWith(
       2,
       'ses-parent',
       'per-1',
@@ -124,7 +126,7 @@ describe('OpenCodeEventHub permission auto-allow fallback', () => {
     hub.setContext(createContext(() => ({ chatId: 'conv-2', source: 'session' }), upsertTimelineNote));
 
     vi.spyOn(permissionHandler, 'isToolWhitelisted').mockReturnValue(true);
-    vi.spyOn(opencodeClient, 'respondToPermission').mockResolvedValue(false);
+    vi.spyOn(activeBackend, 'respondToPermission').mockResolvedValue(false);
     vi.spyOn(chatSessionStore, 'rememberSessionAlias').mockImplementation(() => undefined);
     vi.spyOn(chatSessionStore, 'getConversationBySessionId').mockReturnValue({
       platform: 'discord',
@@ -173,7 +175,7 @@ describe('OpenCodeEventHub permission auto-allow fallback', () => {
       description: 'read file',
     });
 
-    expect(opencodeClient.respondToPermission).toHaveBeenCalledTimes(3);
+    expect(activeBackend.respondToPermission).toHaveBeenCalledTimes(3);
     expect(enqueueSpy).toHaveBeenCalledWith('discord:conv-2', expect.objectContaining({
       sessionId: 'ses-main',
       permissionId: 'per-2',

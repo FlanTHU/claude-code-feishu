@@ -20,6 +20,9 @@ import { cardActionHandler } from '../handlers/card-action.js';
 import { groupConfig, routerConfig } from '../config.js';
 import { chatSessionStore } from '../store/chat-session.js';
 
+const OWNER_TRIGGER_OPEN_IDS = new Set<string>(['ou_4be926dd38eec3b1f93ce9d0b948079d']);
+const OWNER_TRIGGER_KEYWORDS = ['→菈妮', '[→菈妮 完成]', '→菹妇', '[→菹妇 完成]'];
+
 /**
  * 卡片动作处理结果
  */
@@ -94,7 +97,94 @@ export class RootRouter {
     if (!groupConfig.requireMentionInGroup) {
       return false;
     }
-    return !Array.isArray(event.mentions) || event.mentions.length === 0;
+
+    const hasText = this.messageHasTextContent(event);
+    const mentionIds = Array.isArray(event.mentions) ? event.mentions.map(m => m.id?.open_id) : [];
+    const selfOpenIds = new Set<string>();
+    if (groupConfig.botOpenId) selfOpenIds.add(groupConfig.botOpenId);
+    const isMentioned = selfOpenIds.size > 0
+      ? event.mentions?.some(m => selfOpenIds.has(m.id.open_id)) ?? false
+      : false;
+
+    let keywordHit = false;
+    if (hasText && groupConfig.triggerKeywords.length > 0) {
+      const lower = event.content.toLowerCase();
+      keywordHit = groupConfig.triggerKeywords.some(k => lower.includes(k.toLowerCase()));
+    }
+
+    const ownerTriggerHit = this.isOwnerSpecialTrigger(event);
+    const skip = !isMentioned && !keywordHit && !ownerTriggerHit;
+
+    console.log(JSON.stringify({
+      type: '[Router][group-filter]',
+      msgType: event.msgType,
+      chatId: event.chatId?.slice(-12),
+      hasText,
+      mentionIds,
+      isMentioned,
+      keywordHit,
+      ownerTriggerHit,
+      skip,
+      contentPreview: typeof event.content === 'string' ? event.content.slice(0, 200) : null,
+    }));
+
+    return skip;
+  }
+
+  private isOwnerSpecialTrigger(event: FeishuMessageEvent): boolean {
+    if (!event.senderId || !OWNER_TRIGGER_OPEN_IDS.has(event.senderId)) {
+      return false;
+    }
+
+    const content = typeof event.content === 'string' ? event.content : '';
+    if (!content) {
+      return false;
+    }
+
+    return OWNER_TRIGGER_KEYWORDS.some(keyword => content.includes(keyword));
+  }
+
+  private messageHasTextContent(event: FeishuMessageEvent): boolean {
+    const content = event.content;
+    if (!content || typeof content !== 'string') return false;
+
+    // 纯文本消息：直接判断
+    if (event.msgType === 'text') {
+      return content.trim().length > 0;
+    }
+
+    // merge_forward（合并转发）：content 是占位符 "Merged and Forwarded Message"，不视为有文字
+    if (event.msgType === 'merge_forward') {
+      return false;
+    }
+
+    // post（富文本）类型：解析 JSON，检查是否有实际文字
+    if (event.msgType === 'post') {
+      try {
+        const post = JSON.parse(content);
+        const postContent = post?.content;
+        if (!Array.isArray(postContent)) return false;
+        for (const paragraph of postContent) {
+          if (!Array.isArray(paragraph)) continue;
+          for (const item of paragraph) {
+            if (item?.tag === 'text' && typeof item.text === 'string' && item.text.trim().length > 0) {
+              return true;
+            }
+          }
+        }
+        return false;
+      } catch {
+        return content.trim().length > 0;
+      }
+    }
+
+    // image/file/media/sticker 等附件类型：不视为有文字
+    if (['image', 'file', 'media', 'sticker'].includes(event.msgType)) {
+      return false;
+    }
+
+    // 其他类型：兜底判断 content 非空
+    return content.trim().length > 0;
   }
 
   /**

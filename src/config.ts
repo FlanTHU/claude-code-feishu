@@ -1,4 +1,6 @@
 import 'dotenv/config';
+import * as fs from 'fs';
+import * as path from 'path';
 
 function parseBooleanEnv(value: string | undefined, fallback: boolean): boolean {
   const normalized = normalizeBooleanToken(value);
@@ -87,6 +89,10 @@ export const feishuConfig = {
   appSecret: process.env.FEISHU_APP_SECRET || '',
   encryptKey: process.env.FEISHU_ENCRYPT_KEY,
   verificationToken: process.env.FEISHU_VERIFICATION_TOKEN,
+  // WebSocket 应用层重连
+  wsReconnectDelayMs: parseNonNegativeIntEnv(process.env.FEISHU_WS_RECONNECT_DELAY_MS, 5000),
+  wsMaxReconnectAttempts: parseNonNegativeIntEnv(process.env.FEISHU_WS_MAX_RECONNECT_ATTEMPTS, 0), // 0 = 无限
+  wsIdleTimeoutMs: parseNonNegativeIntEnv(process.env.FEISHU_WS_IDLE_TIMEOUT_MS, 90000), // 90s 无消息视为断线
 };
 
 // Discord配置
@@ -127,6 +133,15 @@ export const groupConfig = {
     process.env.GROUP_REQUIRE_MENTION ?? process.env.GROUP_REPLY_REQUIRE_MENTION,
     false
   ),
+  // Bot 自身的 open_id，用于群聊 @ 过滤（只响应 @自己 的消息）
+  // 若未配置则退回旧逻辑（有任意 mention 即触发）
+  botOpenId: process.env.BOT_OPEN_ID?.trim() || '',
+  // 文本关键词触发列表，消息包含任一关键词时等效于 @bot（逗号分隔）
+  // 用于其他 bot 无法直接 @ 时的文本触发方案
+  triggerKeywords: (process.env.BOT_TRIGGER_KEYWORDS ?? '')
+    .split(',')
+    .map(k => k.trim())
+    .filter(k => k.length > 0),
 };
 
 // OpenCode配置
@@ -138,7 +153,49 @@ export const opencodeConfig = {
   get baseUrl() {
     return `http://${this.host}:${this.port}`;
   },
+  // 事件流心跳超时（ms），超时则主动断开重连
+  eventHeartbeatTimeoutMs: parseNonNegativeIntEnv(process.env.OPENCODE_EVENT_HEARTBEAT_TIMEOUT_MS, 60000),
+  eventMaxBackoffMs: parseNonNegativeIntEnv(process.env.OPENCODE_EVENT_MAX_BACKOFF_MS, 30000),
 };
+
+// AI 后端选择:opencode(默认) | claude
+// 同一时间只跑一个后端;切换需重启服务。详见 docs/claude-code-backend-research.md
+const configuredBackend = (process.env.AI_BACKEND || 'opencode').trim().toLowerCase();
+export const backendConfig = {
+  backend: (configuredBackend === 'claude' ? 'claude' : 'opencode') as 'opencode' | 'claude',
+};
+
+// Claude Code(Agent SDK)后端配置 —— 仅 AI_BACKEND=claude 时生效
+export const claudeConfig = {
+  // 鉴权沿用 Agent SDK 认的环境变量:ANTHROPIC_API_KEY / ANTHROPIC_BASE_URL
+  // 这里只配模型与运行参数
+  model: process.env.CLAUDE_MODEL?.trim() || process.env.ANTHROPIC_DEFAULT_OPUS_MODEL?.trim() || undefined,
+  // 工作目录:Claude Code 在此目录读写文件
+  cwd: process.env.CLAUDE_CWD?.trim() || process.cwd(),
+  // 权限模式:default(走 PreToolUse hook 交互) | acceptEdits | bypassPermissions | plan
+  permissionMode: (process.env.CLAUDE_PERMISSION_MODE?.trim() || 'default') as
+    | 'default'
+    | 'acceptEdits'
+    | 'bypassPermissions'
+    | 'plan',
+  // 权限请求在飞书侧等待用户操作的超时(ms),超时按拒绝处理
+  permissionTimeoutMs: parseNonNegativeIntEnv(process.env.CLAUDE_PERMISSION_TIMEOUT_MS, 5 * 60 * 1000),
+  // 人格/交互约束系统提示文件路径(markdown),内容以 append 形式叠加到
+  // Claude Code preset 之上(保留默认工具能力)。默认指向项目内 persona 文件。
+  systemPromptFile:
+    process.env.CLAUDE_SYSTEM_PROMPT_FILE?.trim() ||
+    path.join(process.cwd(), 'persona', 'system-prompt.md'),
+};
+
+// 读取人格系统提示文件内容;文件不存在则返回空(不注入)。
+export function loadClaudeSystemPrompt(): string | undefined {
+  try {
+    const content = fs.readFileSync(claudeConfig.systemPromptFile, 'utf-8').trim();
+    return content || undefined;
+  } catch {
+    return undefined;
+  }
+}
 
 // 用户配置
 export const userConfig = {
@@ -157,6 +214,27 @@ export const userConfig = {
   },
 };
 
+// Owner 配置（群聊安全防注入）
+export const ownerConfig = {
+  // 拥有完整指令权限的 owner open_id 列表（逗号分隔）
+  // 群聊中非 owner 的消息仅允许普通问答，执行操作需 owner 确认
+  ownerIds: (process.env.OWNER_USER_IDS || '')
+    .split(',')
+    .map(item => item.trim())
+    .filter(item => item.length > 0),
+
+  // 是否启用 owner 鉴权（ownerIds 非空时自动启用）
+  get isEnabled() {
+    return this.ownerIds.length > 0;
+  },
+
+  // 判断指定用户是否为 owner
+  isOwner(openId: string): boolean {
+    if (!this.isEnabled) return true; // 未配置则视所有人为 owner
+    return this.ownerIds.includes(openId);
+  },
+};
+
 // 模型配置
 const configuredDefaultProvider = process.env.DEFAULT_PROVIDER?.trim();
 const configuredDefaultModel = process.env.DEFAULT_MODEL?.trim();
@@ -167,6 +245,42 @@ export const modelConfig = {
   defaultProvider: hasConfiguredDefaultModel ? configuredDefaultProvider : undefined,
   defaultModel: hasConfiguredDefaultModel ? configuredDefaultModel : undefined,
 };
+
+function loadModelCapabilities(): Map<string, boolean> {
+  const caps = new Map<string, boolean>();
+  const candidates = [
+    process.env.OPENCODE_CONFIG_PATH,
+    path.join(process.env.HOME || '~', '.config/opencode/opencode.json'),
+    path.join(process.cwd(), 'opencode.json'),
+  ].filter(Boolean) as string[];
+
+  for (const configPath of candidates) {
+    try {
+      if (!fs.existsSync(configPath)) continue;
+      const raw = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
+      const providers = raw.provider || {};
+      for (const [provName, prov] of Object.entries(providers)) {
+        const models = (prov as Record<string, unknown>).models as Record<string, Record<string, unknown>> | undefined;
+        if (!models) continue;
+        for (const [modelId, modelCfg] of Object.entries(models)) {
+          const cfg = modelCfg as Record<string, unknown>;
+          const modalities = cfg.modalities as Record<string, unknown> | undefined;
+          const supports = cfg.attachment === true
+            || (Array.isArray(modalities?.input) && (modalities.input as string[]).includes('image'));
+          caps.set(`${provName}/${modelId}`, supports);
+        }
+      }
+      break;
+    } catch { /* ignore parse errors */ }
+  }
+  return caps;
+}
+
+const modelCapabilityCache = loadModelCapabilities();
+
+export function modelSupportsImages(providerModel: string): boolean {
+  return modelCapabilityCache.get(providerModel) ?? false;
+}
 
 // 权限配置
 export const permissionConfig = {
@@ -184,7 +298,10 @@ const showToolChain = parseBooleanEnv(process.env.SHOW_TOOL_CHAIN, true);
 export const outputConfig = {
   // 输出更新间隔（毫秒）
   updateInterval: parseInt(process.env.OUTPUT_UPDATE_INTERVAL || '3000', 10),
-  
+
+  // 消息发出后无任何输出的超时时间（毫秒）；0 表示禁用
+  silenceTimeoutMs: parseNonNegativeIntEnv(process.env.SILENCE_TIMEOUT_MS, 30000),
+
   // 单条消息最大长度（飞书限制）
   maxMessageLength: 4000,
   

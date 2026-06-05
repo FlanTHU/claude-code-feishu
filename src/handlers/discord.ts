@@ -26,6 +26,7 @@ import { permissionHandler } from '../permissions/handler.js';
 import { chatSessionStore } from '../store/chat-session.js';
 import { validateFilePath } from './file-sender.js';
 import { DirectoryPolicy } from '../utils/directory-policy.js';
+import { isAgentVisibleInPanel } from '../constants/agent-visibility.js';
 import type { PlatformMessageEvent, PlatformSender } from '../platform/types.js';
 
 const PANEL_SELECT_PREFIX = 'oc_panel';
@@ -691,7 +692,7 @@ class DiscordHandler {
 
   private async buildAgentSelectOptions(limit: number = 24): Promise<Array<{ label: string; value: string; description?: string }>> {
     const agents = await opencodeClient.getAgents().catch(() => [] as Array<{ name: string; hidden?: boolean; mode?: 'primary' | 'subagent'; description?: string }>);
-    const visible = agents.filter(agent => agent.hidden !== true && !['compaction', 'title', 'summary'].includes(agent.name));
+    const visible = agents.filter(agent => isAgentVisibleInPanel(agent));
     const options: Array<{ label: string; value: string; description?: string }> = [];
 
     options.push({

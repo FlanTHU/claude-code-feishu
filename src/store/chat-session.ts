@@ -18,6 +18,8 @@ interface ChatSessionData {
   preferredModel?: string;
   preferredAgent?: string;
   preferredEffort?: EffortLevel;
+  /** 最近选用的模型标识（provider:model），用于面板优先展示 */
+  recentModelIds?: string[];
   resolvedDirectory?: string;
   projectName?: string;
   defaultDirectory?: string;
@@ -52,9 +54,43 @@ const SESSION_ALIAS_TTL_MS = 10 * 60 * 1000;
 const NAMESPACE_SEPARATOR = ':';
 type PlatformId = string;
 
+// oh-my-openagent 的 display name → config key 映射（来自 AGENT_DISPLAY_NAMES）
+const AGENT_DISPLAY_NAME_TO_KEY: Record<string, string> = {
+  'sisyphus - ultraworker': 'sisyphus',
+  'hephaestus - deep agent': 'hephaestus',
+  'prometheus - plan builder': 'prometheus',
+  'atlas - plan executor': 'atlas',
+  'sisyphus-junior': 'sisyphus-junior',
+  'metis - plan consultant': 'metis',
+  'momus - plan critic': 'momus',
+  'athena - council': 'athena',
+  'athena-junior - council': 'athena-junior',
+};
+
+// config key → display name 反向映射（存量数据兼容）
+const AGENT_KEY_TO_DISPLAY: Record<string, string> = Object.fromEntries(
+  Object.entries(AGENT_DISPLAY_NAME_TO_KEY).map(([display, key]) => [key, display.charAt(0).toUpperCase() + display.slice(1)])
+);
+
+/**
+ * 规范化 agent 名称：清理零宽字符，确保返回 display name（与 OpenCode 对齐）
+ * 支持三种输入：display name、config key、带零宽字符的变体
+ */
+export function normalizeAgentName(raw: string | undefined): string | undefined {
+  if (!raw) return undefined;
+  const cleaned = raw.replace(/[\u200b\u200c\u200d\ufeff]/g, '').trim();
+  if (!cleaned) return undefined;
+  // 如果输入是 config key，转成 display name
+  const lower = cleaned.toLowerCase();
+  if (AGENT_KEY_TO_DISPLAY[lower]) return AGENT_KEY_TO_DISPLAY[lower];
+  // 否则返回清理后的值（可能是 display name 或其他有效名称）
+  return cleaned;
+}
+
 class ChatSessionStore {
   private data: Map<string, ChatSessionData> = new Map();
   private sessionAliases: Map<string, SessionAliasRecord> = new Map();
+  private compactingSessionIds: Set<string> = new Set();
 
   constructor() {
     this.load();
@@ -66,10 +102,29 @@ class ChatSessionStore {
         const content = fs.readFileSync(STORE_FILE, 'utf-8');
         const parsed = JSON.parse(content);
         this.data = new Map(Object.entries(parsed));
+        this.sanitizeLoadedData();
+        this.save();
         console.log(`[Store] 已加载 ${this.data.size} 个群组会话`);
       }
     } catch (error) {
       console.error('[Store] 加载数据失败:', error);
+    }
+  }
+
+  private sanitizeLoadedData(): void {
+    for (const session of this.data.values()) {
+      if (session && typeof session === 'object' && 'preferredAgent' in session) {
+        const raw = (session as ChatSessionData).preferredAgent;
+        if (typeof raw === 'string') {
+          const normalized = normalizeAgentName(raw);
+          if (!normalized) {
+            console.warn(`[Store] 加载时清除无效 preferredAgent: ${JSON.stringify(raw)}`);
+            delete (session as ChatSessionData).preferredAgent;
+          } else if (normalized !== raw) {
+            (session as ChatSessionData).preferredAgent = normalized;
+          }
+        }
+      }
     }
   }
 
@@ -294,8 +349,14 @@ class ChatSessionStore {
       ...(options?.projectName ? { projectName: options.projectName } : {}),
       ...(current?.defaultDirectory ? { defaultDirectory: current.defaultDirectory } : {}),
       ...(current?.preferredModel ? { preferredModel: current.preferredModel } : {}),
-      ...(current?.preferredAgent ? { preferredAgent: current.preferredAgent } : {}),
+      ...((() => {
+        const a = normalizeAgentName(current?.preferredAgent);
+        return a ? { preferredAgent: a } : {};
+      })()),
       ...(current?.preferredEffort ? { preferredEffort: current.preferredEffort } : {}),
+      ...(current?.recentModelIds && current.recentModelIds.length > 0
+        ? { recentModelIds: [...current.recentModelIds] }
+        : {}),
       interactionHistory: [],
     };
 
@@ -348,8 +409,14 @@ class ChatSessionStore {
       ...(options?.projectName ? { projectName: options.projectName } : {}),
       ...(current?.defaultDirectory ? { defaultDirectory: current.defaultDirectory } : {}),
       ...(current?.preferredModel ? { preferredModel: current.preferredModel } : {}),
-      ...(current?.preferredAgent ? { preferredAgent: current.preferredAgent } : {}),
+      ...((() => {
+        const a = normalizeAgentName(current?.preferredAgent);
+        return a ? { preferredAgent: a } : {};
+      })()),
       ...(current?.preferredEffort ? { preferredEffort: current.preferredEffort } : {}),
+      ...(current?.recentModelIds && current.recentModelIds.length > 0
+        ? { recentModelIds: [...current.recentModelIds] }
+        : {}),
       interactionHistory: [],
     };
 
@@ -443,8 +510,9 @@ class ChatSessionStore {
     }
 
     if ('preferredAgent' in config) {
-      if (config.preferredAgent) {
-        session.preferredAgent = config.preferredAgent;
+      const normalizedAgent = normalizeAgentName(config.preferredAgent);
+      if (normalizedAgent) {
+        session.preferredAgent = normalizedAgent;
       } else {
         delete session.preferredAgent;
       }
@@ -490,8 +558,9 @@ class ChatSessionStore {
     }
 
     if ('preferredAgent' in config) {
-      if (config.preferredAgent) {
-        session.preferredAgent = config.preferredAgent;
+      const normalizedAgent = normalizeAgentName(config.preferredAgent);
+      if (normalizedAgent) {
+        session.preferredAgent = normalizedAgent;
       } else {
         delete session.preferredAgent;
       }
@@ -532,6 +601,20 @@ class ChatSessionStore {
     }
   }
 
+  private static readonly MAX_RECENT_MODELS = 8;
+
+  /** 记录最近选用的模型（去重、置顶），供面板优先展示 */
+  pushRecentModel(chatId: string, modelValue: string): void {
+    const session = this.getChatDataLegacyOrNamespaced(chatId);
+    if (!session) return;
+    const normalized = modelValue.trim();
+    if (!normalized) return;
+    const prev = session.recentModelIds || [];
+    const next = [normalized, ...prev.filter(v => v !== normalized)].slice(0, ChatSessionStore.MAX_RECENT_MODELS);
+    session.recentModelIds = next;
+    this.save();
+  }
+
   private updateLegacyPointers(session: ChatSessionData): void {
     let lastUserMsgId: string | undefined;
     for (let i = session.interactionHistory.length - 1; i >= 0; i--) {
@@ -557,21 +640,20 @@ class ChatSessionStore {
 
   addInteraction(chatId: string, record: InteractionRecord): void {
     const session = this.getChatDataLegacyOrNamespaced(chatId);
-    if (session) {
-      if (!session.interactionHistory) {
-        session.interactionHistory = [];
-      }
-      session.interactionHistory.push(record);
-
-      this.updateLegacyPointers(session);
-
-      if (session.interactionHistory.length > 20) {
-        session.interactionHistory.shift();
-        this.updateLegacyPointers(session);
-      }
-
-      this.save();
+    if (!session) {
+      console.debug(`[Store] addInteraction 跳过：会话不存在 chatId=${chatId?.slice(0, 16)}...`);
+      return;
     }
+    if (!session.interactionHistory) {
+      session.interactionHistory = [];
+    }
+    session.interactionHistory.push(record);
+    this.updateLegacyPointers(session);
+    if (session.interactionHistory.length > 20) {
+      session.interactionHistory.shift();
+      this.updateLegacyPointers(session);
+    }
+    this.save();
   }
 
   popInteraction(chatId: string): InteractionRecord | undefined {
@@ -598,6 +680,12 @@ class ChatSessionStore {
     const session = this.getChatDataLegacyOrNamespaced(chatId);
     if (!session || !session.interactionHistory) return undefined;
     return session.interactionHistory.find(r => r.botFeishuMsgIds.includes(msgId));
+  }
+
+  findInteractionByUserMsgId(chatId: string, msgId: string): InteractionRecord | undefined {
+    const session = this.getChatDataLegacyOrNamespaced(chatId);
+    if (!session || !session.interactionHistory) return undefined;
+    return session.interactionHistory.find(r => r.userFeishuMsgId === msgId);
   }
 
   updateInteraction(chatId: string, predicate: (r: InteractionRecord) => boolean, updater: (r: InteractionRecord) => void): void {
@@ -710,6 +798,28 @@ class ChatSessionStore {
       }
     }
     return result;
+  }
+
+  getAllSessions(): Array<ChatSessionData & { chatId: string }> {
+    const results: Array<ChatSessionData & { chatId: string }> = [];
+    for (const [key, data] of this.data.entries()) {
+      const parsed = this.parseConversationKey(key);
+      const chatId = parsed ? parsed.chatId : key;
+      results.push({ ...data, chatId });
+    }
+    return results;
+  }
+
+  setCompacting(sessionId: string, compacting: boolean): void {
+    if (compacting) {
+      this.compactingSessionIds.add(sessionId);
+    } else {
+      this.compactingSessionIds.delete(sessionId);
+    }
+  }
+
+  isCompacting(sessionId: string): boolean {
+    return this.compactingSessionIds.has(sessionId);
   }
 
   hasConversationId(conversationId: string): boolean {

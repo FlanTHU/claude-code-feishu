@@ -1,4 +1,8 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
+
+// 防止 dotenv 从 .env 加载，确保测试可控制环境变量
+vi.mock('dotenv/config', () => ({}));
+
 import type { FeishuMessageEvent } from '../src/feishu/client.js';
 
 const baseEvent: FeishuMessageEvent = {
@@ -22,7 +26,7 @@ const baseEvent: FeishuMessageEvent = {
   },
 };
 
-const envKeys = ['GROUP_REQUIRE_MENTION', 'GROUP_REPLY_REQUIRE_MENTION'];
+const envKeys = ['GROUP_REQUIRE_MENTION', 'GROUP_REPLY_REQUIRE_MENTION', 'BOT_OPEN_ID'];
 const envBackup = new Map<string, string | undefined>();
 
 const backupEnv = (): void => {
@@ -72,6 +76,7 @@ describe('RootRouter mention gate', () => {
   it('GROUP_REQUIRE_MENTION=true 且有 @ 时应处理群消息', async () => {
     backupEnv();
     process.env.GROUP_REQUIRE_MENTION = 'true';
+    process.env.BOT_OPEN_ID = 'ou_bot'; // 与测试事件的 mention open_id 一致
 
     const { rootRouter, groupHandler } = await loadRouterAndGroup();
     const spy = vi.spyOn(groupHandler, 'handleMessage').mockResolvedValue(undefined);
@@ -94,6 +99,22 @@ describe('RootRouter mention gate', () => {
     expect(spy).toHaveBeenCalledTimes(1);
   });
 
+  it('GROUP_REQUIRE_MENTION=true 且纯附件无文字无 @ 时应跳过群消息', async () => {
+    backupEnv();
+    process.env.GROUP_REQUIRE_MENTION = 'true';
+
+    const { rootRouter, groupHandler } = await loadRouterAndGroup();
+    const spy = vi.spyOn(groupHandler, 'handleMessage').mockResolvedValue(undefined);
+
+    await rootRouter.onMessage({
+      ...baseEvent,
+      content: '',
+      mentions: undefined,
+      attachments: [{ type: 'image', fileKey: 'img_v3_xxx' }],
+    });
+    expect(spy).not.toHaveBeenCalled();
+  });
+
   it('GROUP_REQUIRE_MENTION=true 时应优先处理权限文本回调', async () => {
     backupEnv();
     process.env.GROUP_REQUIRE_MENTION = 'true';
@@ -110,5 +131,55 @@ describe('RootRouter mention gate', () => {
     await rootRouter.onMessage({ ...baseEvent, mentions: undefined, content: '允许' });
     expect(permissionSpy).toHaveBeenCalledTimes(1);
     expect(groupSpy).not.toHaveBeenCalled();
+  });
+
+  it('GROUP_REQUIRE_MENTION=true 且为回复消息但无 @ 时应跳过群消息', async () => {
+    backupEnv();
+    process.env.GROUP_REQUIRE_MENTION = 'true';
+
+    const { rootRouter, groupHandler } = await loadRouterAndGroup();
+    const spy = vi.spyOn(groupHandler, 'handleMessage').mockResolvedValue(undefined);
+
+    await rootRouter.onMessage({
+      ...baseEvent,
+      mentions: undefined,
+      parentId: 'msg-parent-123',
+    });
+    expect(spy).not.toHaveBeenCalled();
+  });
+
+  it('GROUP_REQUIRE_MENTION=true 且图片+文字无 @ 时应跳过群消息', async () => {
+    backupEnv();
+    process.env.GROUP_REQUIRE_MENTION = 'true';
+
+    const { rootRouter, groupHandler } = await loadRouterAndGroup();
+    const spy = vi.spyOn(groupHandler, 'handleMessage').mockResolvedValue(undefined);
+
+    await rootRouter.onMessage({
+      ...baseEvent,
+      msgType: 'text',
+      content: '图片里有什么话题信息',
+      mentions: undefined,
+      attachments: [{ type: 'image', fileKey: 'img_v3_xxx' }],
+    });
+    expect(spy).not.toHaveBeenCalled();
+  });
+
+  it('GROUP_REQUIRE_MENTION=true 且只有 @mention 无文字时应处理群消息', async () => {
+    backupEnv();
+    process.env.GROUP_REQUIRE_MENTION = 'true';
+    process.env.BOT_OPEN_ID = 'ou_bot';
+
+    const { rootRouter, groupHandler } = await loadRouterAndGroup();
+    const spy = vi.spyOn(groupHandler, 'handleMessage').mockResolvedValue(undefined);
+
+    await rootRouter.onMessage({
+      ...baseEvent,
+      msgType: 'text',
+      content: '',
+      mentions: [{ key: '@_user_1', id: { open_id: 'ou_bot' }, name: '菈妮' }],
+      attachments: [{ type: 'image', fileKey: 'img_v3_xxx' }],
+    });
+    expect(spy).toHaveBeenCalledTimes(1);
   });
 });
