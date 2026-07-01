@@ -17,7 +17,7 @@ import type { PlatformMessageEvent, PlatformActionEvent } from '../platform/type
 import { p2pHandler } from '../handlers/p2p.js';
 import { groupHandler } from '../handlers/group.js';
 import { cardActionHandler } from '../handlers/card-action.js';
-import { groupConfig, routerConfig } from '../config.js';
+import { groupConfig, routerConfig, ownerConfig } from '../config.js';
 import { chatSessionStore } from '../store/chat-session.js';
 
 const OWNER_TRIGGER_OPEN_IDS = new Set<string>(['ou_4be926dd38eec3b1f93ce9d0b948079d']);
@@ -113,7 +113,13 @@ export class RootRouter {
     }
 
     const ownerTriggerHit = this.isOwnerSpecialTrigger(event);
-    const skip = !isMentioned && !keywordHit && !ownerTriggerHit;
+    // owner 发的合并转发消息免 @ 放行：转发聊天记录通常不会 @ bot，
+    // 但 owner 转发即代表想让 bot 看，故对 merge_forward 类型单独放行。仅限 owner，避免群噪音。
+    const ownerForwardHit =
+      event.msgType === 'merge_forward' &&
+      !!event.senderId &&
+      ownerConfig.isOwner(event.senderId);
+    const skip = !isMentioned && !keywordHit && !ownerTriggerHit && !ownerForwardHit;
 
     console.log(JSON.stringify({
       type: '[Router][group-filter]',
@@ -124,6 +130,7 @@ export class RootRouter {
       isMentioned,
       keywordHit,
       ownerTriggerHit,
+      ownerForwardHit,
       skip,
       contentPreview: typeof event.content === 'string' ? event.content.slice(0, 200) : null,
     }));

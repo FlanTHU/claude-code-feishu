@@ -1,5 +1,6 @@
 import * as lark from '@larksuiteoapi/node-sdk';
-import { feishuConfig } from '../config.js';
+import { feishuConfig, groupConfig } from '../config.js';
+import { forwardPairing } from '../handlers/forward-pairing.js';
 import { EventEmitter } from 'events';
 import type { ReadStream } from 'fs';
 import { readFileSync, writeFileSync, mkdirSync } from 'fs';
@@ -373,9 +374,13 @@ class FeishuClient extends EventEmitter {
     });
 
     // 创建事件分发器
+    // loggerLevel 设为 error:SDK 默认 info 级别会对每个未订阅 handler 的事件
+    // (task.task.update_tenant_v1、im.message.reaction 等飞书主动推送)打 warn,
+    // 纯噪音且无害,但会撑爆 stderr 日志(曾涨到 1.1GB)。降到 error 从源头消除。
     this.eventDispatcher = new lark.EventDispatcher({
       encryptKey: feishuConfig.encryptKey,
       verificationToken: feishuConfig.verificationToken,
+      loggerLevel: lark.LoggerLevel.error,
     });
   }
 
@@ -424,7 +429,9 @@ class FeishuClient extends EventEmitter {
     this.eventDispatcher.register({
       'im.message.receive_v1': (data) => {
         this.touchLastMessage();
-        this.handleMessage(data as FeishuEventData);
+        void this.handleMessage(data as FeishuEventData).catch(err => {
+          console.error('[飞书] handleMessage 异步处理失败:', err);
+        });
         return { msg: 'ok' };
       },
       'im.message.message_read_v1': (data) => {
@@ -489,7 +496,7 @@ class FeishuClient extends EventEmitter {
   }
 
   // 处理接收到的消息
-  private handleMessage(data: FeishuEventData): void {
+  private async handleMessage(data: FeishuEventData): Promise<void> {
     try {
       const message = data.message;
       const sender = data.sender;
@@ -517,8 +524,16 @@ class FeishuClient extends EventEmitter {
         return;
       }
 
+      // bot 消息默认丢弃以防机器人互刷；仅放行白名单内的 bot（如协作的 agent bot）。
+      // 放行后仍受群聊 requireMentionInGroup（需 @ 才触发）约束。
       if (sender.sender_type === 'bot') {
-        return;
+        const botOpenId = sender.sender_id?.open_id || '';
+        const allowed = botOpenId && groupConfig.allowedBotOpenIds.has(botOpenId);
+        console.log(`[飞书][bot-diag] 收到 bot 消息: openId=${botOpenId || '(空)'}, allowed=${allowed}, allowlist=[${Array.from(groupConfig.allowedBotOpenIds).join(',')}], msgId=${msgId}`);
+        if (!allowed) {
+          return;
+        }
+        console.log(`[飞书] 放行白名单 bot 消息: openId=${botOpenId}`);
       }
 
       const msgType = message.message_type;
@@ -551,6 +566,19 @@ class FeishuClient extends EventEmitter {
       if (!content && parsedContent && msgType === 'interactive') {
         const cardText = extractTextFromInteractive(parsedContent);
         if (cardText) content = cardText;
+      }
+
+      // merge_forward（合并转发）：事件 content 里只有摘要，需调 im.message.get
+      // 拉取子消息列表（含 upper_message_id），按各自类型提取文本后拼接成可读块。
+      if (msgType === 'merge_forward') {
+        // 配对插旗：必须在拉子消息的 await 之前【同步】调用，否则后到但更快的
+        // @提问文字消息会先跑完而看不到旗标，无法合并 → 详见 forward-pairing.ts。
+        forwardPairing.begin(message.chat_id, sender.sender_id?.open_id || '');
+        const forwardText = await this.extractMergeForwardText(message.message_id);
+        if (forwardText) {
+          content = content ? `${content}\n${forwardText}` : forwardText;
+        }
+        forwardPairing.ready(message.chat_id, forwardText || '');
       }
 
       const attachments: FeishuAttachment[] = [];
@@ -636,6 +664,68 @@ class FeishuClient extends EventEmitter {
       this.emit('message', messageEvent);
     } catch (error) {
       console.error('[飞书] 解析消息失败:', error);
+    }
+  }
+
+  /**
+   * 提取合并转发消息的文本内容。
+   * 飞书合并转发(merge_forward)的事件 content 仅含摘要，需调用 im.message.get
+   * 拉取子消息列表，按各子消息的 msg_type 分别提取文本，拼接成可读块。
+   */
+  private async extractMergeForwardText(messageId: string): Promise<string> {
+    try {
+      const response = await this.client.im.message.get({
+        path: { message_id: messageId },
+        params: { user_id_type: 'open_id' },
+      });
+      const items = response.data?.items ?? [];
+      console.log(`[飞书][merge_forward] msgId=${messageId} 拉到子消息 ${items.length} 条`);
+
+      const lines: string[] = [];
+      for (const item of items) {
+        // 跳过转发容器自身，只取被转发的子消息。
+        if (item.message_id === messageId) continue;
+        const childType = item.msg_type;
+        const rawBody = item.body?.content;
+        if (!rawBody) continue;
+
+        let parsed: Record<string, unknown> | null = null;
+        try {
+          parsed = JSON.parse(rawBody) as Record<string, unknown>;
+        } catch {
+          parsed = null;
+        }
+
+        let text = '';
+        if (parsed && typeof parsed.text === 'string') {
+          text = parsed.text;
+        } else if (parsed && childType === 'post') {
+          text = extractTextFromPost(parsed);
+        } else if (parsed && childType === 'interactive') {
+          text = extractTextFromInteractive(parsed);
+        } else if (childType === 'image') {
+          text = '[图片]';
+        } else if (childType === 'file') {
+          const name = parsed ? getString(parsed.file_name) : undefined;
+          text = name ? `[文件: ${name}]` : '[文件]';
+        }
+
+        text = text.trim();
+        if (text) {
+          const senderName = item.sender?.id ? `${item.sender.id.slice(-6)}` : '?';
+          lines.push(`[${senderName}] ${text}`);
+        }
+      }
+
+      if (lines.length === 0) {
+        console.log(`[飞书][merge_forward] msgId=${messageId} 未提取到可读文本`);
+        return '';
+      }
+      return `【转发消息】\n${lines.join('\n')}`;
+    } catch (error) {
+      const formatted = formatError(error);
+      console.error('[飞书][merge_forward] 拉取子消息失败:', formatted.message, formatted.responseData ?? '');
+      return '';
     }
   }
 

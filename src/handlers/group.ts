@@ -7,14 +7,15 @@ import { parseQuestionAnswerText } from '../opencode/question-parser.js';
 import { parseCommand } from '../commands/parser.js';
 import type { EffortLevel } from '../commands/effort.js';
 import { commandHandler } from './command.js';
-import { modelConfig, attachmentConfig, outputConfig, modelSupportsImages } from '../config.js';
-import { resolveGroupAccess, buildMemberPromptPrefix, buildOwnerPromptPrefix } from '../permissions/group-access.js';
+import { modelConfig, attachmentConfig, outputConfig, modelSupportsImages, groupConfig } from '../config.js';
+import { resolveGroupAccess, buildMemberPromptPrefix, buildOwnerPromptPrefix, buildBotPromptPrefix } from '../permissions/group-access.js';
 import { permissionHandler } from '../permissions/handler.js';
 import { DirectoryPolicy } from '../utils/directory-policy.js';
 import { parseProviderModelString } from '../utils/provider-model.js';
 import { buildSessionTimestamp } from '../utils/session-title.js';
 import { openCodeEventHub } from '../router/opencode-event-hub.js';
 import type { PendingCompactionMessage } from '../router/opencode-event-hub.js';
+import { forwardPairing } from './forward-pairing.js';
 
 import { randomUUID } from 'crypto';
 import path from 'path';
@@ -275,6 +276,12 @@ export class GroupHandler {
     const { chatId, content, messageId, senderId, attachments, senderType, mentions, chatType: eventChatType } = event;
     const trimmed = content.trim();
 
+    // 转发体自身：若窗口内被配对的 @提问文字 consume 走（合并成一个 prompt），则静默，
+    // 避免「没看到内容」+「内容评论」双回复撞同一张卡。否则独立处理（content 已是转发正文）。
+    if (event.msgType === 'merge_forward') {
+      if (await forwardPairing.waitToBeConsumed(chatId)) return;
+    }
+
     const access = resolveGroupAccess(senderId);
 
     // 1. 优先处理命令
@@ -337,13 +344,34 @@ export class GroupHandler {
       console.log(`[Group-Session] Existing session: chatId=${chatId.slice(-12)}, sessionId=${sessionId}, chatType=${existingSession?.chatType}, title=${existingSession?.title}`);
     }
 
+    // 4.5 bot↔bot 接力防回环硬闸（往返计数）
+    // - owner 真人发言：清零计数，解除暂停（实现"回复即放行"）。
+    // - 白名单 bot 触发：计数 +1，达到上限则暂停自动接力，停下来请 owner 介入。
+    if (senderType === 'user' && access.isOwner) {
+      chatSessionStore.resetBotRelayRounds(chatId);
+    } else if (senderType === 'bot') {
+      const rounds = chatSessionStore.incrementBotRelayRounds(chatId, groupConfig.botRelayCooldownMs);
+      if (rounds > groupConfig.botRelayMaxRounds) {
+        console.log(`[Group] bot 接力达上限(${rounds}/${groupConfig.botRelayMaxRounds})，暂停自动接力，等待 owner 确认: chatId=${chatId.slice(-12)}`);
+        await feishuClient.reply(
+          messageId,
+          `⏸️ bot 连续接力已达 ${groupConfig.botRelayMaxRounds} 轮上限，已暂停自动接力。\n@owner 回复任意消息即可清零计数、继续接力。`
+        );
+        return;
+      }
+    }
+
     // 5. 处理 Prompt
     // 记录用户消息ID
     chatSessionStore.updateLastInteraction(chatId, messageId);
-    
+
     // 获取当前会话配置
     const sessionConfig = chatSessionStore.getSession(chatId);
-    const promptText = command.text ?? trimmed;
+    // 配对挂起的转发：同发送者刚转发了 merge_forward，则等其正文拼好并合并进本条 prompt，
+    // 只发一个 prompt（无挂起转发/不同发送者 → 同步返回 null，零额外延迟）。
+    const forwardText = await forwardPairing.consume(chatId, senderId);
+    const basePrompt = command.text ?? trimmed;
+    const promptText = forwardText ? `${basePrompt}\n\n${forwardText}` : basePrompt;
     await this.processPrompt(sessionId, promptText, chatId, messageId, attachments, sessionConfig, command.promptEffort, access.isOwner ? 'owner' : 'member', senderId, senderType, mentions);
   }
 
@@ -365,45 +393,42 @@ export class GroupHandler {
     const allow = command.permissionAllow ?? (command.permissionResponse === 'y');
     const remember = command.permissionRemember ?? false;
 
-    // 子 agent 会连续产生多个权限请求，队首可能已在后端超时失效（僵尸）。
-    // 逐个尝试：响应失败说明该 permissionId 已失效，剔除后试下一个，
-    // 直到命中一个真正挂起的请求或队列耗尽。
+    // 一条消息可能触发多个权限请求。用户回一次 y/always 应处理当前全部挂起。
+    // 先快照（避免边处理边被子 agent 新入队影响），逐个按同一决定响应；
+    // 响应失败=该 id 已超时/失效（僵尸），跳过计数即可。
+    const snapshot = permissionHandler.snapshotForChat(chatId);
+    let ok = 0;
     let skipped = 0;
-    let pending = permissionHandler.peekForChat(chatId);
-    while (pending) {
+    const okTools = new Set<string>();
+    for (const item of snapshot) {
       const responded = await activeBackend.respondToPermission(
-        pending.sessionId,
-        pending.permissionId,
+        item.sessionId,
+        item.permissionId,
         allow,
         remember
       );
-
-      // 无论成败都从队列剔除该项（失败=僵尸，成功=已处理）
-      permissionHandler.resolveForChat(chatId, pending.permissionId);
-
+      permissionHandler.resolveForChat(chatId, item.permissionId);
       if (responded) {
-        const toolName = pending.tool || '工具';
-        console.log(
-          `[Group-权限] 响应成功: chat=${chatId}, permission=${pending.permissionId}, allow=${allow}, remember=${remember}, skippedStale=${skipped}`
-        );
-        await feishuClient.reply(
-          messageId,
-          allow
-            ? remember ? `✅ 已允许并记住权限：${toolName}` : `✅ 已允许权限：${toolName}`
-            : `❌ 已拒绝权限：${toolName}`
-        );
-        return true;
+        ok++;
+        okTools.add(item.tool || '工具');
+      } else {
+        skipped++;
       }
-
-      skipped++;
-      console.warn(
-        `[Group-权限] 跳过失效请求: chat=${chatId}, permission=${pending.permissionId}(已超时/已处理)`
-      );
-      pending = permissionHandler.peekForChat(chatId);
     }
 
-    console.error(`[Group-权限] 无有效挂起权限可响应: chat=${chatId}, skippedStale=${skipped}`);
-    await feishuClient.reply(messageId, '⚠️ 该权限请求已失效（可能已超时）。如仍需操作，请重新发起。');
+    console.log(
+      `[Group-权限] 批量响应: chat=${chatId}, allow=${allow}, remember=${remember}, ok=${ok}, skippedStale=${skipped}, total=${snapshot.length}`
+    );
+
+    if (ok === 0) {
+      await feishuClient.reply(messageId, '⚠️ 待确认的权限请求均已失效（可能已超时）。如仍需操作，请重新发起。');
+      return true;
+    }
+
+    const toolList = Array.from(okTools).join('、');
+    const verb = allow ? (remember ? '已允许并记住' : '已允许') : '已拒绝';
+    const tail = skipped > 0 ? `（另有 ${skipped} 项已失效跳过）` : '';
+    await feishuClient.reply(messageId, `${allow ? '✅' : '❌'} ${verb} ${ok} 项权限：${toolList}${tail}`);
     return true;
   }
 
@@ -617,10 +642,13 @@ export class GroupHandler {
       effectiveText += `\n<!--ctx:type=${currentChatType},send_file_to=${chatId},sender_id=${senderId || 'unknown'}${senderTag}${mentionsTag}-->`;
 
       // 注入来源标记，防止 prompt 注入攻击
+      // bot 消息优先套 bot 专用前缀：身份只认平台 sender_id、禁操作性指令、截断不脑补。
       const sourcePrefix = senderId
-        ? (senderRole === 'owner'
-            ? buildOwnerPromptPrefix(senderId)
-            : buildMemberPromptPrefix(senderId))
+        ? (senderType === 'bot'
+            ? buildBotPromptPrefix(senderId)
+            : senderRole === 'owner'
+              ? buildOwnerPromptPrefix(senderId)
+              : buildMemberPromptPrefix(senderId))
         : '';
       if (sourcePrefix) {
         effectiveText = sourcePrefix + effectiveText;

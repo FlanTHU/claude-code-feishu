@@ -14,7 +14,8 @@ import { lifecycleHandler } from './handlers/lifecycle.js';
 import { createDiscordHandler } from './handlers/discord.js';
 import { commandHandler } from './handlers/command.js';
 import { cardActionHandler } from './handlers/card-action.js';
-import { validateConfig, routerConfig, outputConfig, modelConfig, claudeConfig } from './config.js';
+import { validateConfig, routerConfig, outputConfig, modelConfig, claudeConfig, groupConfig } from './config.js';
+import { parseBotMentions } from './feishu/bot-mention.js';
 import { rootRouter } from './router/root-router.js';
 import {
   createPermissionActionCallbacks,
@@ -76,6 +77,8 @@ async function main() {
   const retryNoticeMap = new Map<string, string>();
   const errorNoticeMap = new Map<string, string>();
   const streamCardMessageIdsMap = new Map<string, string[]>();
+  // 已补发过 bot @ 触发消息的 buffer.key，防止 completed 回调多次触发时重复 @
+  const botMentionSentKeys = new Set<string>();
   const STREAM_CARD_COMPONENT_BUDGET = 175;
   const CORRELATION_CACHE_TTL_MS = 10 * 60 * 1000;
 
@@ -1195,9 +1198,47 @@ async function main() {
 
     if (!hasVisibleAfterFilter && existingMessageIds.length === 0 && statusAtStart === 'running') return;
 
-    let effectiveText = current.text;
+    // 解析正文里的 bot @ 标记：剥离后用于卡片展示，open_id 留待完成时补发 text @ 触发对方 bot
+    const botMention = parseBotMentions(current.text, groupConfig.allowedBotOpenIds);
+    let effectiveText = botMention.text;
     if (!hasVisibleAfterFilter && status !== 'processing') {
       effectiveText = status === 'completed' ? '✅ 已完成' : '❌ 执行失败';
+    }
+
+    // bot 对谈模式：本群不发互动卡片。流式期间静默，完成时整段发一条 text 消息（选法 X）。
+    // 有 @mention → 带 @ 触发对方 bot；无 mention → 纯文本，保证每轮都有输出。
+    // 这条 text 的 content.text 是对方 bot 读取的稳定契约，无需解析卡片内部结构。
+    if (platform === 'feishu' && chatTypeForCard === 'group' && chatSessionStore.isBotDialogMode(conversationId)) {
+      if (statusAtStart === 'running') return; // 无流式，等完成时一次性发
+
+      const reactionStatus = statusAtStart === 'failed' || statusAtStart === 'aborted' ? 'failed' : 'completed';
+      const reactionText = buffer.finalText || current.text || '';
+      const completionEmoji = pickCompletionReaction(reactionStatus, reactionText);
+      void groupHandler.removeTypingAndAddCompletionReaction(buffer.chatId, completionEmoji, conversationId, buffer.replyMessageId, buffer.key);
+      groupHandler.cancelSilenceTimer(conversationId);
+
+      // 仅在本次回调带真实内容时发送；completed 回调可能多次触发，重复触发时 current 已被清空 →
+      // hasVisibleAfterFilter 为 false 且无 openIds → 跳过，天然去重（与卡片路径同一套幂等语义）。
+      if (hasVisibleAfterFilter || botMention.openIds.length > 0) {
+        const body = effectiveText || (reactionStatus === 'completed' ? '✅ 已完成' : '❌ 执行失败');
+        if (reactionStatus === 'completed' && botMention.openIds.length > 0) {
+          const mentions = botMention.openIds.map(openId => ({ openId, name: '' }));
+          void feishuClient.sendMentionText(conversationId, mentions, body).catch(() => undefined);
+          console.log(`[Index] bot对谈 完成@发送: chatId=${conversationId.slice(-8)}, openIds=[${botMention.openIds.join(',')}], len=${body.length}`);
+        } else {
+          void feishuClient.sendText(conversationId, body).catch(() => undefined);
+          console.log(`[Index] bot对谈 完成发送(无@): chatId=${conversationId.slice(-8)}, status=${reactionStatus}, len=${body.length}`);
+        }
+      }
+
+      console.log(`[Index] bot对谈 completed cleanup: key=${buffer.key}, status=${statusAtStart}`);
+      streamContentMap.delete(buffer.key);
+      streamToolStateMap.delete(buffer.key);
+      streamTimelineMap.delete(buffer.key);
+      streamCardMessageIdsMap.delete(buffer.key);
+      clearPartSnapshotsForSession(buffer.sessionId);
+      outputBuffer.clear(buffer.key);
+      return;
     }
 
     const sessionForCard = chatSessionStore.getSession(conversationId);
@@ -1350,7 +1391,25 @@ async function main() {
       // 群聊和私聊都会添加 Typing，完成时统一替换为完成 reaction；buffer.key 用于 userMessageIdByBufferKey 兜底
       void groupHandler.removeTypingAndAddCompletionReaction(buffer.chatId, completionEmoji, conversationId, buffer.replyMessageId, buffer.key);
       groupHandler.cancelSilenceTimer(conversationId);
+
+      // 卡片里的 <at> 不进 mentions[]，触发不了其他 bot；完成时对白名单 bot 补发一条 text @ 消息触发对方。
+      // 仅群聊、仅成功完成、仅首次（completed 回调可能多次触发）。
+      if (
+        reactionStatus === 'completed' &&
+        chatTypeForCard === 'group' &&
+        botMention.openIds.length > 0 &&
+        !botMentionSentKeys.has(buffer.key)
+      ) {
+        botMentionSentKeys.add(buffer.key);
+        const mentions = botMention.openIds.map(openId => ({ openId, name: '' }));
+        // 卡片正文不进对方 bot 的消息事件，对方只能读到这条 text @ 消息的正文。
+        // 之前传空串导致对方收到空 @、读不到讨论内容；这里把正文一并带上。
+        void feishuClient.sendMentionText(conversationId, mentions, botMention.text).catch(() => undefined);
+        console.log(`[Index] bot @ 补发: chatId=${conversationId.slice(-8)}, openIds=[${botMention.openIds.join(',')}]`);
+      }
+
       console.log(`[Index] completed cleanup: key=${buffer.key}, nextIds=${nextMessageIds.length}, status=${statusAtStart}`);
+      botMentionSentKeys.delete(buffer.key);
       streamContentMap.delete(buffer.key);
       streamToolStateMap.delete(buffer.key);
       streamTimelineMap.delete(buffer.key);

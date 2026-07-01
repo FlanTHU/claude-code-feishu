@@ -896,6 +896,10 @@ export class CommandHandler {
           await this.handleCleanupSessions(messageId);
           break;
 
+        case 'botmode':
+          await this.handleBotMode(chatId, messageId, context.chatType, command.botModeAction);
+          break;
+
         // 其他命令透传
         default:
           await this.handlePassthroughCommand(chatId, messageId, command.type.replace(/^\//, ''), command.commandArgs || '');
@@ -906,6 +910,44 @@ export class CommandHandler {
       console.error('[Command] 执行失败详情:', errorMessage);
       await feishuClient.reply(messageId, '❌ 命令执行出错，请稍后重试');
     }
+  }
+
+  /**
+   * bot 对谈模式开关：开启后本群不再发互动卡片，每轮完成时整段发一条 text 消息，
+   * 供对方 bot 读 content.text（消除"卡片+补发 text 全文"的内容重复）。仅群聊有意义。
+   */
+  private async handleBotMode(
+    chatId: string,
+    messageId: string,
+    chatType: 'p2p' | 'group',
+    action?: 'on' | 'off' | 'status'
+  ): Promise<void> {
+    if (chatType !== 'group') {
+      await feishuClient.reply(messageId, 'ℹ️ bot 对谈模式仅在群聊生效。');
+      return;
+    }
+
+    if (!action || action === 'status') {
+      const on = chatSessionStore.isBotDialogMode(chatId);
+      await feishuClient.reply(
+        messageId,
+        `bot 对谈模式：${on ? '🟢 已开启（本群不发卡片，整段发 text）' : '⚪️ 未开启（正常卡片）'}\n用法：/botmode on | off`
+      );
+      return;
+    }
+
+    const enabled = action === 'on';
+    const result = chatSessionStore.setBotDialogMode(chatId, enabled);
+    if (result === null) {
+      await feishuClient.reply(messageId, '❌ 当前群未绑定会话，先发一条消息激活会话后再试。');
+      return;
+    }
+    await feishuClient.reply(
+      messageId,
+      enabled
+        ? '🟢 已开启 bot 对谈模式：本群后续回复不再发卡片，改为整段发一条 text 消息（对方 bot 读 content.text）。'
+        : '⚪️ 已关闭 bot 对谈模式：本群恢复正常互动卡片。'
+    );
   }
 
   private async handleCleanupSessions(messageId: string): Promise<void> {

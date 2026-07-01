@@ -116,6 +116,12 @@ class PermissionHandler {
     return this.pendingByChat.get(chatId)?.length || 0;
   }
 
+  // 快照某 chat 当前全部待确认权限（浅拷贝，避免边遍历边被新入队影响）
+  snapshotForChat(chatId: string): PendingPermission[] {
+    this.removeExpired(chatId);
+    return [...(this.pendingByChat.get(chatId) ?? [])];
+  }
+
   // 按 permissionId 出队
   resolveForChat(chatId: string, permissionId: string): PendingPermission | undefined {
     this.removeExpired(chatId);

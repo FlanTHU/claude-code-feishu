@@ -22,7 +22,8 @@ export type CommandType =
   | 'permission'   // 权限响应
   | 'send'         // 发送文件到飞书
   | 'rename'       // 重命名当前会话
-  | 'cleanup';     // 清理历史 sessions
+  | 'cleanup'      // 清理历史 sessions
+  | 'botmode';     // 切换 bot 对谈模式（本群不建卡片，整段发 text）
 
 // 解析后的命令
 export interface ParsedCommand {
@@ -53,6 +54,7 @@ export interface ParsedCommand {
   promptEffort?: EffortLevel;
   adminAction?: 'add';
   renameTitle?: string;    // rename 类型的新会话名称（可选，无参数时弹卡片）
+  botModeAction?: 'on' | 'off' | 'status'; // botmode 子命令：开/关/查看
 }
 
 const BANG_SHELL_ALLOWED_COMMANDS = new Set([
@@ -405,6 +407,14 @@ export function parseCommand(text: string): ParsedCommand {
       case 'clean':
         return { type: 'cleanup' };
 
+      case 'botmode': {
+        const sub = (args[0] ?? '').toLowerCase();
+        if (sub === 'on' || sub === 'off') {
+          return { type: 'botmode', botModeAction: sub };
+        }
+        return { type: 'botmode', botModeAction: 'status' };
+      }
+
       default:
         // 未知命令透传到OpenCode
         return {
@@ -462,6 +472,7 @@ export function getHelpText(): string {
 • \`/clear\` 等价 \`/session new\`；\`/clear free session\` 清理空闲群聊
 • \`/cleanup\` 清理历史 sessions（删除 subagent/tiny sessions，归档旧会话）
 • \`/status\` 查看当前绑定状态和群聊生命周期信息
+• \`/botmode on|off\` 群聊 bot 对谈模式：开启后本群不发卡片，整段发一条 text（供对方 bot 读取），消除卡片与 @ 文本的内容重复；\`/botmode\` 查看当前状态
 
 💡 **提示**
 • 切换的模型/角色仅对**当前会话**生效。

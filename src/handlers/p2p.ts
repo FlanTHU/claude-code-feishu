@@ -532,46 +532,42 @@ private getSessionOptionLabel(session: OpencodeSession, highlightWorkspace: bool
     const allow = command.permissionAllow ?? (command.permissionResponse === 'y');
     const remember = command.permissionRemember ?? false;
 
-    // 子 agent 会连续产生多个权限请求，队首可能已在后端超时失效（僵尸）。
-    // 逐个尝试：响应失败说明该 permissionId 已失效，剔除后试下一个，
-    // 直到命中一个真正挂起的请求或队列耗尽。
+    // 一条消息可能触发多个权限请求。用户回一次 y/always 应处理当前全部挂起。
+    // 先快照（避免边处理边被子 agent 新入队影响），逐个按同一决定响应；
+    // 响应失败=该 id 已超时/失效（僵尸），跳过计数即可。
+    const snapshot = permissionHandler.snapshotForChat(chatId);
+    let ok = 0;
     let skipped = 0;
-    let pending = permissionHandler.peekForChat(chatId);
-    while (pending) {
+    const okTools = new Set<string>();
+    for (const item of snapshot) {
       const responded = await activeBackend.respondToPermission(
-        pending.sessionId,
-        pending.permissionId,
+        item.sessionId,
+        item.permissionId,
         allow,
         remember
       );
-
-      // 无论成败都从队列剔除该项（失败=僵尸，成功=已处理）
-      permissionHandler.resolveForChat(chatId, pending.permissionId);
-
+      permissionHandler.resolveForChat(chatId, item.permissionId);
       if (responded) {
-        const toolName = pending.tool || '工具';
-        console.log(
-          `[P2P-权限] 响应成功: chat=${chatId}, permission=${pending.permissionId}, allow=${allow}, remember=${remember}, skippedStale=${skipped}`
-        );
-        await this.safeReply(
-          messageId,
-          chatId,
-          allow
-            ? remember ? `✅ 已允许并记住权限：${toolName}` : `✅ 已允许权限：${toolName}`
-            : `❌ 已拒绝权限：${toolName}`
-        );
-        return true;
+        ok++;
+        okTools.add(item.tool || '工具');
+      } else {
+        skipped++;
       }
-
-      skipped++;
-      console.warn(
-        `[P2P-权限] 跳过失效请求: chat=${chatId}, permission=${pending.permissionId}(已超时/已处理)`
-      );
-      pending = permissionHandler.peekForChat(chatId);
     }
 
-    console.error(`[P2P-权限] 无有效挂起权限可响应: chat=${chatId}, skippedStale=${skipped}`);
-    await this.safeReply(messageId, chatId, '⚠️ 该权限请求已失效（可能已超时）。如仍需操作，请重新发起。');
+    console.log(
+      `[P2P-权限] 批量响应: chat=${chatId}, allow=${allow}, remember=${remember}, ok=${ok}, skippedStale=${skipped}, total=${snapshot.length}`
+    );
+
+    if (ok === 0) {
+      await this.safeReply(messageId, chatId, '⚠️ 待确认的权限请求均已失效（可能已超时）。如仍需操作，请重新发起。');
+      return true;
+    }
+
+    const toolList = Array.from(okTools).join('、');
+    const verb = allow ? (remember ? '已允许并记住' : '已允许') : '已拒绝';
+    const tail = skipped > 0 ? `（另有 ${skipped} 项已失效跳过）` : '';
+    await this.safeReply(messageId, chatId, `${allow ? '✅' : '❌'} ${verb} ${ok} 项权限：${toolList}${tail}`);
     return true;
   }
 
