@@ -1,6 +1,7 @@
 import 'dotenv/config';
 import * as fs from 'fs';
 import * as path from 'path';
+import { execFileSync } from 'child_process';
 
 function parseBooleanEnv(value: string | undefined, fallback: boolean): boolean {
   const normalized = normalizeBooleanToken(value);
@@ -142,6 +143,27 @@ export const groupConfig = {
     .split(',')
     .map(k => k.trim())
     .filter(k => k.length > 0),
+  // 允许接收消息的 bot open_id 白名单（逗号分隔）。
+  // 默认 bot 消息全部丢弃以防机器人互刷；列入此名单的 bot 消息放行，
+  // 后续仍受 requireMentionInGroup（需 @ 才触发）约束。
+  allowedBotOpenIds: new Set(
+    (process.env.ALLOWED_BOT_OPEN_IDS ?? '')
+      .split(',')
+      .map(id => id.trim())
+      .filter(id => id.length > 0)
+  ),
+  // bot↔bot 连续接力的最大往返轮数。白名单 bot 每触发一次 +1，owner 真人发言清零；
+  // 达到上限后暂停自动接力，需 owner 介入确认。防止两个 bot 互相触发无限回环。
+  botRelayMaxRounds: (() => {
+    const n = parseInt(process.env.BOT_RELAY_MAX_ROUNDS ?? '10', 10);
+    return Number.isFinite(n) && n > 0 ? n : 10;
+  })(),
+  // bot↔bot 接力计数的冷却时长（毫秒）。距上次接力超过此时长视为新对话，
+  // 计数自动归零。默认 30 分钟，避免跨越长时间的对话被误算成连续接力。
+  botRelayCooldownMs: (() => {
+    const n = parseInt(process.env.BOT_RELAY_COOLDOWN_MS ?? '', 10);
+    return Number.isFinite(n) && n > 0 ? n : 30 * 60 * 1000;
+  })(),
 };
 
 // OpenCode配置
@@ -185,7 +207,43 @@ export const claudeConfig = {
   systemPromptFile:
     process.env.CLAUDE_SYSTEM_PROMPT_FILE?.trim() ||
     path.join(process.cwd(), 'persona', 'system-prompt.md'),
+  // hmem 跨会话长期记忆(复用 opencode 的 hmem-mcp-fork,标准 stdio MCP)。
+  // 接入开关:默认开;CLAUDE_ENABLE_HMEM=false 可一键关闭。
+  // 鉴权 key 从环境变量或 macOS keychain 读,不硬编码;取不到则不接入(软降级)。
+  hmem: {
+    enabled: parseBooleanEnv(process.env.CLAUDE_ENABLE_HMEM, true),
+    // 启动 hmem 的 node 可执行文件,默认用运行 bridge 的同一 node
+    nodeBin: process.env.HMEM_NODE_BIN?.trim() || process.execPath,
+    // hmem-mcp-fork 的 CLI 入口
+    cli:
+      process.env.HMEM_MCP_CLI?.trim() ||
+      path.join(process.env.HOME || '~', '.config/opencode/hmem-mcp-fork/dist/cli.js'),
+    // 记忆库目录(SQLite 所在)
+    projectDir:
+      process.env.HMEM_PROJECT_DIR?.trim() ||
+      path.join(process.env.HOME || '~', '.hmem'),
+    // embedding 走 mify,禁用本地 ollama(与 opencode 配置一致)
+    ollamaDisabled: parseBooleanEnv(process.env.HMEM_OLLAMA_DISABLED, true),
+  },
 };
+
+// 解析 hmem 算 embedding 所需的 MIFY_API_KEY:优先环境变量,
+// 回落到 macOS keychain(account=opencode, service=MIFY_API_KEY,与
+// opencode 的 dream-distill 同源)。两者都取不到返回空串。
+export function resolveMifyApiKey(): string {
+  const fromEnv = process.env.MIFY_API_KEY?.trim();
+  if (fromEnv) return fromEnv;
+  try {
+    const fromKeychain = execFileSync(
+      'security',
+      ['find-generic-password', '-a', 'opencode', '-s', 'MIFY_API_KEY', '-w'],
+      { encoding: 'utf-8' }
+    ).trim();
+    return fromKeychain || '';
+  } catch {
+    return '';
+  }
+}
 
 // 读取人格系统提示文件内容;文件不存在则返回空(不注入)。
 export function loadClaudeSystemPrompt(): string | undefined {

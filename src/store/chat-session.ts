@@ -1,6 +1,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import type { EffortLevel } from '../commands/effort.js';
+import { botDialogModeStore } from './bot-dialog-mode.js';
 
 export type ChatSessionType = 'p2p' | 'group';
 
@@ -24,6 +25,10 @@ interface ChatSessionData {
   projectName?: string;
   defaultDirectory?: string;
   reminderSent?: boolean;
+  /** bot↔bot 连续接力的当前往返轮数。白名单 bot 触发时 +1，owner 真人发言清零。 */
+  botRelayRounds?: number;
+  /** 最近一次 bot 接力计数的时间戳（ms），用于冷却过期自动归零。 */
+  lastBotRelayAt?: number;
   interactionHistory: InteractionRecord[];
 }
 
@@ -597,6 +602,58 @@ class ChatSessionStore {
     const session = this.getChatDataLegacyOrNamespaced(chatId);
     if (session) {
       session.resolvedDirectory = directory;
+      this.save();
+    }
+  }
+
+  /**
+   * 读取本群是否处于 bot 对谈模式。
+   * 存储独立于会话生命周期（见 bot-dialog-mode.ts）：重启/会话重绑不会丢失该标志。
+   */
+  isBotDialogMode(chatId: string): boolean {
+    return botDialogModeStore.isEnabled(chatId);
+  }
+
+  /**
+   * 切换本群 bot 对谈模式，返回设置后的值；群未绑定会话返回 null（供上层提示）。
+   * 标志本身写入独立 store，不随会话记录被替换而丢失。
+   */
+  setBotDialogMode(chatId: string, enabled: boolean): boolean | null {
+    const session = this.getChatDataLegacyOrNamespaced(chatId);
+    if (!session) return null;
+    botDialogModeStore.set(chatId, enabled);
+    return enabled;
+  }
+
+  /** 读取当前 bot↔bot 连续接力轮数（无会话或未计数时返回 0）。 */
+  getBotRelayRounds(chatId: string): number {
+    const session = this.getChatDataLegacyOrNamespaced(chatId);
+    return session?.botRelayRounds ?? 0;
+  }
+
+  /**
+   * 白名单 bot 触发时调用，往返轮数 +1 并返回新值。
+   * 若距上次接力已超过 cooldownMs（>0 时生效），先视为新对话归零再计数。
+   */
+  incrementBotRelayRounds(chatId: string, cooldownMs = 0): number {
+    const session = this.getChatDataLegacyOrNamespaced(chatId);
+    if (!session) return 0;
+    const now = Date.now();
+    const last = session.lastBotRelayAt ?? 0;
+    if (cooldownMs > 0 && last > 0 && now - last > cooldownMs) {
+      session.botRelayRounds = 0;
+    }
+    session.botRelayRounds = (session.botRelayRounds ?? 0) + 1;
+    session.lastBotRelayAt = now;
+    this.save();
+    return session.botRelayRounds;
+  }
+
+  /** owner 真人发言时调用，清零接力计数（已为 0 则跳过持久化）。 */
+  resetBotRelayRounds(chatId: string): void {
+    const session = this.getChatDataLegacyOrNamespaced(chatId);
+    if (session && (session.botRelayRounds ?? 0) !== 0) {
+      session.botRelayRounds = 0;
       this.save();
     }
   }

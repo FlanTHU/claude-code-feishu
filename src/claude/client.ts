@@ -13,6 +13,7 @@
 
 import { EventEmitter } from 'events';
 import { randomUUID } from 'crypto';
+import * as fs from 'fs';
 import {
   query,
   type Query,
@@ -20,6 +21,7 @@ import {
   type SDKUserMessage,
   type PreToolUseHookInput,
   type HookJSONOutput,
+  type McpStdioServerConfig,
 } from '@anthropic-ai/claude-agent-sdk';
 import type { Session, Message, Part, Project } from '@opencode-ai/sdk';
 import type { BetaRawMessageStreamEvent } from '@anthropic-ai/sdk/resources/beta/messages/messages';
@@ -29,7 +31,7 @@ import type {
   OpencodeAgentInfo,
   ShellExecutionResult,
 } from '../opencode/client.js';
-import { claudeConfig, loadClaudeSystemPrompt } from '../config.js';
+import { claudeConfig, loadClaudeSystemPrompt, resolveMifyApiKey } from '../config.js';
 import type {
   AiBackend,
   BackendSendOptions,
@@ -66,6 +68,8 @@ class ClaudeClientWrapper extends EventEmitter implements AiBackend {
   private lastHeartbeatAt = 0;
   // 人格/交互约束系统提示(启动时加载一次,append 到 claude_code preset)
   private systemPrompt: string | undefined;
+  // hmem MCP 配置(启动时构建一次;key 取不到或开关关闭则为空,不接入)
+  private mcpServers: Record<string, McpStdioServerConfig> = {};
 
   // ── 连接生命周期 ──────────────────────────────────────────
   async connect(): Promise<boolean> {
@@ -75,18 +79,48 @@ class ClaudeClientWrapper extends EventEmitter implements AiBackend {
       return false;
     }
     this.systemPrompt = loadClaudeSystemPrompt();
+    this.mcpServers = this.buildMcpServers();
     this.connected = true;
     this.lastHeartbeatAt = Date.now();
     console.log(
       `[Claude] 已就绪 model=${claudeConfig.model ?? '(SDK 默认)'} cwd=${claudeConfig.cwd} ` +
         `baseUrl=${process.env.ANTHROPIC_BASE_URL ?? '(官方)'} ` +
-        `systemPrompt=${this.systemPrompt ? `${this.systemPrompt.length} 字符` : '无'}`
+        `systemPrompt=${this.systemPrompt ? `${this.systemPrompt.length} 字符` : '无'} ` +
+        `mcp=${Object.keys(this.mcpServers).join(',') || '无'}`
     );
     return true;
   }
 
   getConnectionStatus(): { connected: boolean; lastHeartbeatAt: number } {
     return { connected: this.connected, lastHeartbeatAt: this.lastHeartbeatAt };
+  }
+
+  // 构建 hmem MCP server 配置(stdio)。开关关闭、CLI 不存在或 key 取不到时
+  // 返回空对象(软降级,不接入 hmem,不影响其余功能)。
+  private buildMcpServers(): Record<string, McpStdioServerConfig> {
+    const h = claudeConfig.hmem;
+    if (!h.enabled) return {};
+    if (!fs.existsSync(h.cli)) {
+      console.warn(`[Claude] hmem 已启用但 CLI 不存在,跳过接入: ${h.cli}`);
+      return {};
+    }
+    const mifyApiKey = resolveMifyApiKey();
+    if (!mifyApiKey) {
+      console.warn('[Claude] hmem 已启用但取不到 MIFY_API_KEY(环境变量/keychain 均无),跳过接入');
+      return {};
+    }
+    return {
+      hmem: {
+        type: 'stdio',
+        command: h.nodeBin,
+        args: [h.cli, 'serve'],
+        env: {
+          HMEM_PROJECT_DIR: h.projectDir,
+          MIFY_API_KEY: mifyApiKey,
+          ...(h.ollamaDisabled ? { HMEM_OLLAMA_DISABLED: 'true' } : {}),
+        },
+      },
+    };
   }
 
   disconnect(): void {
@@ -378,10 +412,18 @@ class ClaudeClientWrapper extends EventEmitter implements AiBackend {
 
     let assistantMsgId = `msg-${randomUUID()}`;
 
-    // 记录已通过 stream_event 流式发出的 content block 索引,避免 assistant
-    // 完整消息到达时对同一文本重复 emit(流式链路与非流式链路二选一)。
-    const streamedText = new Set<number>();
-    const streamedThinking = new Set<number>();
+    // 一轮 agentic query 会产生多条 assistant 消息(每次工具调用前后各一条)。
+    // 去重键与 part.id 都以 SDK 的真实消息 id(message.id,如 msg_bdrk_...)为基:
+    // 该 id 在「流式增量 stream_event」与「完整 assistant 消息」两条轨里恒等、跨轮唯一,
+    // 两轨天然对齐。曾用自造 assistantMsgId+msgSeq+index 拼键,但流式的 event.index
+    // (thinking 占 0、text 占 1)与完整消息数组下标(每条事件单块、下标恒 0)是两套编号,
+    // 永不相等 → 去重必失效,同段文本被 emit 两遍(重复回复 bug,已实测复现)。
+    // currentRealId 由 message_start 事件刷新,供其后的 content_block_delta 复用。
+    let currentRealId = assistantMsgId;
+
+    // 记录已通过 stream_event 流式发出的块,键 `t:${realId}:${index}` / `k:${realId}:${index}`
+    // (t/k 区分 text/thinking),完整 assistant 消息到达时据此跳过,避免对同一文本重复 emit。
+    const streamedKeys = new Set<string>();
     try {
       const q = query({
         prompt: this.singleUserMessage(content),
@@ -395,6 +437,7 @@ class ClaudeClientWrapper extends EventEmitter implements AiBackend {
           ...(this.systemPrompt
             ? { systemPrompt: { type: 'preset', preset: 'claude_code', append: this.systemPrompt } as const }
             : {}),
+          ...(Object.keys(this.mcpServers).length ? { mcpServers: this.mcpServers } : {}),
           ...(session.claudeSessionId ? { resume: session.claudeSessionId } : {}),
           hooks: {
             PreToolUse: [
@@ -423,28 +466,37 @@ class ClaudeClientWrapper extends EventEmitter implements AiBackend {
 
         // 流式增量:文本 / 思考(若该链路提供 partial messages)
         if (msg.type === 'stream_event') {
-          this.handleStreamEvent(sessionId, assistantMsgId, msg.event, streamedText, streamedThinking);
+          // message_start 刷新真实消息 id,供其后 content_block_delta 建立去重键。
+          const ev = msg.event as { type?: string; message?: { id?: string } };
+          if (ev?.type === 'message_start' && ev.message?.id) {
+            currentRealId = ev.message.id;
+          }
+          this.handleStreamEvent(sessionId, currentRealId, msg.event, streamedKeys);
           continue;
         }
 
         // 完整 assistant 消息:提取 text / thinking / tool_use 块。
         // 非流式链路(无 stream_event)下,文本只在这里出现,必须提取,
-        // 否则会出现空回复(E2E 实测发现的 bug)。已流式发出的块跳过避免重复。
+        // 否则会出现空回复(E2E 实测发现的 bug)。已流式发出的块按 realId+类型跳过避免重复。
         if (msg.type === 'assistant') {
+          // 完整消息的 message.id 与流式轨的 realId 恒等,据此判定该块是否已流式发出。
+          const realId = (msg.message as { id?: string })?.id || assistantMsgId;
           msg.message.content.forEach((block, index) => {
             if (typeof block !== 'object') return;
             if (block.type === 'text') {
-              if (streamedText.has(index)) return;
+              if (streamedKeys.has(`t:${realId}`)) return;
+              streamedKeys.add(`t:${realId}`);
               this.emit('messagePartUpdated', {
                 sessionID: sessionId,
-                part: { type: 'text', id: `${assistantMsgId}-${index}`, messageID: assistantMsgId },
+                part: { type: 'text', id: `${realId}-${index}`, messageID: realId },
                 delta: block.text,
               });
             } else if (block.type === 'thinking') {
-              if (streamedThinking.has(index)) return;
+              if (streamedKeys.has(`k:${realId}`)) return;
+              streamedKeys.add(`k:${realId}`);
               this.emit('messagePartUpdated', {
                 sessionID: sessionId,
-                part: { type: 'reasoning', id: `${assistantMsgId}-think-${index}`, messageID: assistantMsgId },
+                part: { type: 'reasoning', id: `${realId}-think-${index}`, messageID: realId },
                 delta: block.thinking,
               });
             } else if (block.type === 'tool_use') {
@@ -455,7 +507,7 @@ class ClaudeClientWrapper extends EventEmitter implements AiBackend {
                   tool: block.name,
                   callID: block.id,
                   id: block.id,
-                  messageID: assistantMsgId,
+                  messageID: realId,
                   state: { status: 'running' },
                   input: block.input,
                 },
@@ -516,30 +568,32 @@ class ClaudeClientWrapper extends EventEmitter implements AiBackend {
     }
   }
 
-  // 流式增量事件:从 BetaRawMessageStreamEvent 提取 text/thinking delta
+  // 流式增量事件:从 BetaRawMessageStreamEvent 提取 text/thinking delta。
+  // 去重键以真实消息 id(realId)为基、按类型区分(t/k),不含 index:流式的 event.index
+  // 与完整消息数组下标是两套编号(见 runQuery 注释),带 index 反而对不上;而一条逻辑
+  // 消息内 text/thinking 各一块,realId 粒度已足以标识。part.id 保留 index 供下游区分块。
   private handleStreamEvent(
     sessionId: string,
-    assistantMsgId: string,
+    realId: string,
     event: BetaRawMessageStreamEvent,
-    streamedText: Set<number>,
-    streamedThinking: Set<number>
+    streamedKeys: Set<string>
   ): void {
     if (event.type !== 'content_block_delta') return;
     const delta = event.delta;
     const index = event.index;
 
     if (delta.type === 'text_delta') {
-      streamedText.add(index);
+      streamedKeys.add(`t:${realId}`);
       this.emit('messagePartUpdated', {
         sessionID: sessionId,
-        part: { type: 'text', id: `${assistantMsgId}-${index}`, messageID: assistantMsgId },
+        part: { type: 'text', id: `${realId}-${index}`, messageID: realId },
         delta: delta.text,
       });
     } else if (delta.type === 'thinking_delta') {
-      streamedThinking.add(index);
+      streamedKeys.add(`k:${realId}`);
       this.emit('messagePartUpdated', {
         sessionID: sessionId,
-        part: { type: 'reasoning', id: `${assistantMsgId}-think-${index}`, messageID: assistantMsgId },
+        part: { type: 'reasoning', id: `${realId}-think-${index}`, messageID: realId },
         delta: delta.thinking,
       });
     }
@@ -556,6 +610,12 @@ class ClaudeClientWrapper extends EventEmitter implements AiBackend {
     }
 
     const tool = input.tool_name;
+
+    // hmem 记忆工具(mcp__hmem__*):读写主人自己的记忆库,低风险且需高频自动调用,
+    // 静默放行,否则每次 recall/store 都弹飞书卡片,"主动记忆"无从谈起。
+    if (tool.startsWith('mcp__hmem__')) {
+      return { decision: 'approve' };
+    }
 
     // 用户已对本会话该工具选过「始终允许」→ 直接放行,不再弹卡片
     if (this.sessions.get(sessionId)?.rememberedTools.has(tool)) {

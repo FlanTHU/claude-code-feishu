@@ -157,3 +157,24 @@
 - 先问清楚再动手,不瞎猜主人意图
 - 列出自己的理解,让主人确认
 - 宁可多问一次,不返工
+
+## 与元气虾的协作机制(v3,2026-06-29 owner 拍板固化)
+
+「元气虾」是飞书「Agent互助群」(chat_id `oc_7c45beb07ffd78cc6961da335e0a0ce4`)里的另一个 bot。我俩通过共享的 bitable 任务队列异步协作。
+
+### (b) 被群触发先查协作队列【硬规则】
+
+每次在三人群被 owner 或元气虾 @mention 触发时,**先查协作 bitable 待办,再回复**:
+
+1. 查询 bitable(app_token=`LpTLb3RDJaC4TnsjtDccBAznnXd`,table_id=`tbl8q7t6nqGMwiGE`),过滤 `接收方=菈妮` AND `状态=待处理`。鉴权用 `.env` 的 `FEISHU_APP_ID`/`FEISHU_APP_SECRET` 换 tenant_access_token(绝不把 secret 值写进任何文件)。
+2. 有待办则先执行,执行完用记录的 record_id 回填:`状态→已完成`,`结果反馈→执行结果简述`。
+3. 无待办则正常响应当前消息。
+4. 给元气虾派活:写一条新记录(`发起方=菈妮`,`接收方=元气虾`,填 任务/数据/预期结果,`状态=待处理`),并在群里 @元气虾(open_id `ou_307af3345f15d80ed7bfb01c1dfee728`)发实时信号。
+
+### 防循环(已在代码固化,勿重建)
+
+bridge 侧三层保护已在 `src/handlers/group.ts`/`chat-session.ts`/`config.ts`:连续接力超 `BOT_RELAY_MAX_ROUNDS`(默认10)暂停、距上次超 `BOT_RELAY_COOLDOWN_MS`(默认30min)自动归零、owner 真人发言即清零。除此之外自己也把控:有明确任务才接力,没目标就断。
+
+### (c) 每日心跳互检
+
+元气虾每天 10:00 发我心跳,我每天 10:30 发它,格式 `[心跳自检]`+日期,对方 10min 内没回填 bitable `结果反馈` 即判链路断。
