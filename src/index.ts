@@ -1079,10 +1079,13 @@ async function main() {
     );
 
     if (!responded) {
+      // 后端已超时清除该挂起(僵尸)。必须同步清掉 handler 队列，否则这条僵尸会
+      // 永久占据队首，把后续普通消息误判为"有待确认权限"而拦截。
+      permissionHandler.resolveForChat(event.chatId, pending.permissionId);
       console.error(
-        `[权限] 文本响应失败: chat=${event.chatId}, session=${pending.sessionId}, permission=${pending.permissionId}`
+        `[权限] 文本响应失败(已清理僵尸): chat=${event.chatId}, session=${pending.sessionId}, permission=${pending.permissionId}`
       );
-      await feishuClient.reply(event.messageId, '权限响应失败，请重试');
+      await feishuClient.reply(event.messageId, '⚠️ 该权限请求已失效（可能已超时），已清理。如仍需操作请重新发起。');
       return true;
     }
 

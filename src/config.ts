@@ -357,9 +357,15 @@ export function modelSupportsImages(providerModel: string): boolean {
 export const permissionConfig = {
   // 自动允许的工具列表
   toolWhitelist: (process.env.TOOL_WHITELIST || 'Read,Glob,Grep,Task').split(',').filter(Boolean),
-  
-  // 权限请求超时时间（毫秒）；<= 0 表示不超时，始终等待用户回复
-  requestTimeout: parseNonNegativeIntEnv(process.env.PERMISSION_REQUEST_TIMEOUT_MS, 0),
+
+  // 权限请求超时时间（毫秒）；<= 0 表示不超时，始终等待用户回复。
+  // Claude 后端下若未显式配置，自动对齐到 claude 侧硬超时 + 30s 宽限：
+  // claude 侧 timer 先触发并 resolve(deny)，宽限期内用户回复走 Fix B 清僵尸；
+  // 超过宽限则 handler 侧 removeExpired 兜底清除，避免永久僵尸挡住后续普通消息。
+  requestTimeout: parseNonNegativeIntEnv(
+    process.env.PERMISSION_REQUEST_TIMEOUT_MS,
+    backendConfig.backend === 'claude' ? claudeConfig.permissionTimeoutMs + 30_000 : 0
+  ),
 };
 
 // 输出配置

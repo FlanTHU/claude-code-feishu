@@ -92,6 +92,12 @@ class ClaudeClientWrapper extends EventEmitter implements AiBackend {
   }
 
   getConnectionStatus(): { connected: boolean; lastHeartbeatAt: number } {
+    // 有挂起的权限请求时,后端并非"无响应",而是在等用户回 允许/拒绝——
+    // 此时 SDK query 阻塞在 PreToolUse hook 上不产生新消息,lastHeartbeatAt 会枯竭。
+    // 返回新鲜心跳,避免群心跳看门狗(group.ts)把"等人回权限"误判为卡死并标记 failed。
+    if (this.pendingPermissions.size > 0) {
+      return { connected: this.connected, lastHeartbeatAt: Date.now() };
+    }
     return { connected: this.connected, lastHeartbeatAt: this.lastHeartbeatAt };
   }
 
