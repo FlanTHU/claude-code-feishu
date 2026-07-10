@@ -14,7 +14,7 @@ import { lifecycleHandler } from './handlers/lifecycle.js';
 import { createDiscordHandler } from './handlers/discord.js';
 import { commandHandler } from './handlers/command.js';
 import { cardActionHandler } from './handlers/card-action.js';
-import { validateConfig, routerConfig, outputConfig, modelConfig, claudeConfig, groupConfig } from './config.js';
+import { validateConfig, routerConfig, outputConfig, modelConfig, claudeConfig, groupConfig, singletonConfig } from './config.js';
 import { parseBotMentions } from './feishu/bot-mention.js';
 import { rootRouter } from './router/root-router.js';
 import {
@@ -31,6 +31,7 @@ import {
 } from './feishu/cards-stream.js';
 import { startLocalApiServer, stopLocalApiServer } from './api/local-api.js';
 import { pickCompletionReaction } from './utils/reaction-picker.js';
+import { acquireSingletonLock } from './utils/singleton-lock.js';
 
 async function main() {
 
@@ -45,6 +46,18 @@ async function main() {
     console.error('配置错误:', error);
     process.exit(1);
   }
+
+  // 1.2. 单例锁:独占绑定锁端口,拦住任何路径的重复启动(launchd/systemd/看门狗/手动裸起)。
+  // 防止多实例同连飞书长连接导致同一条消息被回复两次。
+  const singletonLock = await acquireSingletonLock(singletonConfig.port);
+  if (!singletonLock) {
+    // 退出码 0 = 礼让退出,避免 launchd(KeepAlive)/systemd(Restart=always)把它当崩溃疯狂重启。
+    console.error(
+      `[Singleton] 锁端口 ${singletonConfig.port} 已被占用,说明已有 bridge 实例在运行,本实例礼让退出`
+    );
+    process.exit(0);
+  }
+  console.log(`[Singleton] 已获取单例锁(端口 ${singletonConfig.port})`);
 
   // 1.5. 路由器模式配置
   console.log(`[Config] 路由器模式: ${routerConfig.mode}`);
@@ -1636,6 +1649,12 @@ async function main() {
       questionHandler.cleanupExpired(0);
     } catch (e) {
       console.error('清理资源失败:', e);
+    }
+
+    try {
+      singletonLock.close();
+    } catch (e) {
+      console.error('释放单例锁失败:', e);
     }
 
     stopLocalApiServer().finally(() => {

@@ -756,8 +756,16 @@ function buildStreamCardPayload(
 
   const bodyElements: object[] = [...normalizedElements];
 
-  if (statusColor === 'green' && data?.status === 'completed' && data.messageId) {
+  const isFinished = data?.status === 'completed' || data?.status === 'failed';
+  if (isFinished && outputConfig.feishu.personaSignature) {
     bodyElements.push({ tag: 'hr' });
+    bodyElements.push({
+      tag: 'markdown',
+      content: `<font color="grey">🌙 Ranni · ${pickRanniSignature(data)}</font>`,
+    });
+  }
+
+  if (statusColor === 'green' && data?.status === 'completed' && data.messageId) {
     bodyElements.push({
       tag: 'markdown',
       content: `<font color="grey">已完成${data.elapsedSecs ? `  ·  耗时 ${formatElapsed(data.elapsedSecs)}` : ''}  ·  ${data.messageId.slice(0, 24)}...</font>`,
@@ -804,6 +812,56 @@ function formatElapsed(secs: number): string {
   const m = Math.floor(secs / 60);
   const s = secs % 60;
   return s > 0 ? `${m}m${s}s` : `${m}m`;
+}
+
+// 菈妮人格签名池：按场景分档，同档内按 messageId 稳定轮换
+// （卡片流式 update 时选句必须稳定，避免刷新时签名闪动）
+// 调性：月之魔女 Ranni——冷冽、克制、有距离感，务实的底子裹在星月意象里
+const RANNI_SIGNATURES = {
+  // 干过活（有工具调用完成）——事已办妥，冷冽收尾
+  worked: [
+    '尘埃落定，主人过目。',
+    '办妥。此事已入我掌中。',
+    '收工。碍事的隐患，一并抹去了。',
+    '月光已为你铺好路。',
+    '成了——这点小事，不劳你费神。',
+    '妥了。风险的影子，我先斩了。',
+    '如约完成，你安心便是。',
+    'done。剩下的，交给时间。',
+  ],
+  // 纯问答——点到为止，落子由你
+  answered: [
+    '话已至此，要落子只需你一句。',
+    '答案在此，动手与否，你定。',
+    '点到为止——下一步呢？',
+    '就这些。想深究，再唤我。',
+    '如你所愿。',
+    '思路已铺开，走不走这条路，看你。',
+    '记下了。何时落地，等你号令。',
+  ],
+  // 失败——不粉饰，给方向
+  failed: [
+    '这一步断了。卡点在上，方向由你定。',
+    '未竟。要我另辟一途么？',
+    '败了——不必粉饰，且看上面的症结。',
+    '此路不通。别急，退回来重想。',
+    '受阻了。我守在这，你说往哪走。',
+  ],
+} as const;
+
+function pickRanniSignature(data: StreamCardData): string {
+  const pool = data.status === 'failed'
+    ? RANNI_SIGNATURES.failed
+    : (data.tools && data.tools.some(t => t.status === 'completed'))
+      ? RANNI_SIGNATURES.worked
+      : RANNI_SIGNATURES.answered;
+  // 用 messageId 做稳定 hash 选句：同一条消息多次刷新选中同一句，不同消息各异
+  const seed = data.messageId || '';
+  let hash = 0;
+  for (let i = 0; i < seed.length; i++) {
+    hash = (hash * 31 + seed.charCodeAt(i)) >>> 0;
+  }
+  return pool[hash % pool.length];
 }
 
 export function buildStreamCards(data: StreamCardData, options?: StreamCardBuildOptions): object[] {

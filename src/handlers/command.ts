@@ -1802,7 +1802,11 @@ export class CommandHandler {
     }
   }
 
-  private async buildPanelCard(chatId: string, chatType: 'p2p' | 'group' = 'group'): Promise<object> {
+  private async buildPanelCard(
+    chatId: string,
+    chatType: 'p2p' | 'group' = 'group',
+    intro?: { userName: string },
+  ): Promise<object> {
     const session = chatSessionStore.getSession(chatId);
     const currentModel = session?.preferredModel || '默认';
     const currentEffort = session?.preferredEffort || '默认（自动）';
@@ -1895,11 +1899,18 @@ export class CommandHandler {
       currentEffort,
       models: panelModelOptions,
       agents: agentOptions,
+      intro,
     });
   }
 
   public async pushPanelCard(chatId: string, chatType: 'p2p' | 'group' = 'group'): Promise<void> {
     const card = await this.buildPanelCard(chatId, chatType);
+    await feishuClient.sendCard(chatId, card);
+  }
+
+  /** 首次私聊「三合一」欢迎面板：欢迎语 + 建群入口 + 控制面板合并为一张卡 */
+  public async pushWelcomePanelCard(chatId: string, userName: string): Promise<void> {
+    const card = await this.buildPanelCard(chatId, 'p2p', { userName });
     await feishuClient.sendCard(chatId, card);
   }
 

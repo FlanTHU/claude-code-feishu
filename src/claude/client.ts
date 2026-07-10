@@ -347,11 +347,12 @@ class ClaudeClientWrapper extends EventEmitter implements AiBackend {
     providers: Array<{ id: string; name: string; models: Array<{ id: string; name: string }> }>;
     default: Record<string, string>;
   }> {
-    // 暴露当前配置的单一模型,供面板显示
-    const model = claudeConfig.model;
-    if (!model) return { providers: [], default: {} };
+    // 暴露当前配置的模型,供面板显示
+    const models = claudeConfig.models;
+    const model = claudeConfig.model || models[0];
+    if (models.length === 0 || !model) return { providers: [], default: {} };
     return {
-      providers: [{ id: 'claude', name: 'Claude', models: [{ id: model, name: model }] }],
+      providers: [{ id: 'claude', name: 'Claude', models: models.map(item => ({ id: item, name: item })) }],
       default: { claude: model },
     };
   }
@@ -670,7 +671,7 @@ class ClaudeClientWrapper extends EventEmitter implements AiBackend {
     // 仅接受不含 opencode provider 前缀的纯模型 ID 覆盖;
     // 形如 "Provider/xxx/yyy" 的 opencode 风格一律忽略,回落到配置的模型。
     const candidate = options?.modelId?.trim();
-    if (candidate && !options?.providerId) {
+    if (candidate && (!options?.providerId || options.providerId === 'claude')) {
       return candidate;
     }
     return claudeConfig.model;

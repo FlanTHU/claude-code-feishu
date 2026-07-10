@@ -180,6 +180,12 @@ export const opencodeConfig = {
   eventMaxBackoffMs: parseNonNegativeIntEnv(process.env.OPENCODE_EVENT_MAX_BACKOFF_MS, 30000),
 };
 
+// 单例锁配置:用独占绑定该端口实现进程互斥,防止多实例同连飞书导致重复回复。
+// 独立于 opencode(4096)与 local-api(4097)端口。详见 src/utils/singleton-lock.ts
+export const singletonConfig = {
+  port: parseInt(process.env.BRIDGE_SINGLETON_PORT || '4099', 10),
+};
+
 // AI 后端选择:opencode(默认) | claude
 // 同一时间只跑一个后端;切换需重启服务。详见 docs/claude-code-backend-research.md
 const configuredBackend = (process.env.AI_BACKEND || 'opencode').trim().toLowerCase();
@@ -192,6 +198,13 @@ export const claudeConfig = {
   // 鉴权沿用 Agent SDK 认的环境变量:ANTHROPIC_API_KEY / ANTHROPIC_BASE_URL
   // 这里只配模型与运行参数
   model: process.env.CLAUDE_MODEL?.trim() || process.env.ANTHROPIC_DEFAULT_OPUS_MODEL?.trim() || undefined,
+  models: [
+    process.env.CLAUDE_MODEL?.trim() || process.env.ANTHROPIC_DEFAULT_OPUS_MODEL?.trim() || undefined,
+    ...(process.env.CLAUDE_MODELS || '')
+      .split(',')
+      .map(item => item.trim())
+      .filter(item => item.length > 0),
+  ].filter((item, index, items): item is string => Boolean(item) && items.indexOf(item) === index),
   // 工作目录:Claude Code 在此目录读写文件
   cwd: process.env.CLAUDE_CWD?.trim() || process.cwd(),
   // 权限模式:default(走 PreToolUse hook 交互) | acceptEdits | bypassPermissions | plan
@@ -373,6 +386,8 @@ export const outputConfig = {
   feishu: {
     showThinkingChain: parseOptionalBooleanEnv(process.env.FEISHU_SHOW_THINKING_CHAIN) ?? showThinkingChain,
     showToolChain: parseOptionalBooleanEnv(process.env.FEISHU_SHOW_TOOL_CHAIN) ?? showToolChain,
+    // 完成卡片底部的人格签名（菈妮落款），默认开启
+    personaSignature: parseBooleanEnv(process.env.FEISHU_PERSONA_SIGNATURE, true),
   },
   
   // Discord 平台特定可见性控制

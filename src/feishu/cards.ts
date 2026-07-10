@@ -208,6 +208,10 @@ export interface ControlCardData {
   currentEffort?: string;
   models: Array<{ label: string; value: string }>;
   agents: Array<{ label: string; value: string }>;
+  // 首次私聊「三合一」欢迎面板：在面板顶部注入欢迎语 + 建群入口，替代单独的欢迎卡/帮助长文
+  intro?: {
+    userName: string;
+  };
 }
 
 export function buildControlCard(data: ControlCardData): object {
@@ -221,6 +225,26 @@ export function buildControlCard(data: ControlCardData): object {
     value: item.value,
   }));
 
+  // 首次私聊：面板顶部注入欢迎语 + 建群按钮，把原来的「欢迎卡 + 帮助长文 + 面板」三连合并成一张
+  const introElements: object[] = data.intro
+    ? [
+        {
+          tag: 'div',
+          text: {
+            tag: 'lark_md',
+            content: `你好 **${data.intro.userName}**，我是你的 AI 助手。直接发消息即可对话。\n\n并行处理多个任务时，建议点下方按钮创建专属会话群（独立上下文，不易串线）。发送 \`/help\` 查看全部命令。`,
+          },
+        },
+        {
+          tag: 'button',
+          text: { tag: 'plain_text', content: '➕ 创建新会话群' },
+          type: 'primary',
+          value: { action: 'create_chat' },
+        },
+        { tag: 'hr' },
+      ]
+    : [];
+
   return {
     schema: '2.0',
     config: {
@@ -229,12 +253,13 @@ export function buildControlCard(data: ControlCardData): object {
     header: {
       title: {
         tag: 'plain_text',
-        content: '🎛️ 会话控制面板',
+        content: data.intro ? '👋 欢迎使用 · 会话控制面板' : '🎛️ 会话控制面板',
       },
       template: 'blue',
     },
     body: {
     elements: [
+      ...introElements,
       {
         tag: 'div',
         text: {

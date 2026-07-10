@@ -3,14 +3,13 @@ import { activeBackend } from '../backend/active.js';
 import { chatSessionStore } from '../store/chat-session.js';
 import {
   buildCreateChatCard,
-  buildWelcomeCard,
   CREATE_CHAT_NEW_SESSION_VALUE,
   type CreateChatCardData,
   type CreateChatSessionOption,
 } from '../feishu/cards.js';
 import { DirectoryPolicy, type DirectorySource } from '../utils/directory-policy.js';
 import { buildSessionTimestamp } from '../utils/session-title.js';
-import { parseCommand, getHelpText, type ParsedCommand } from '../commands/parser.js';
+import { parseCommand, type ParsedCommand } from '../commands/parser.js';
 import { commandHandler } from './command.js';
 import { groupHandler } from './group.js';
 import { permissionHandler } from '../permissions/handler.js';
@@ -442,22 +441,13 @@ private getSessionOptionLabel(session: OpencodeSession, highlightWorkspace: bool
     return command.type === 'session' && command.sessionAction === 'new';
   }
 
-  private async pushFirstContactGuidance(chatId: string, senderId: string, messageId: string): Promise<void> {
-    const createChatData = await this.buildCreateChatCardData();
-    const card = buildWelcomeCard(senderId, createChatData);
-    const welcomeCardMessageId = await feishuClient.sendCard(chatId, card);
-    this.rememberCreateChatSelection(
-      CREATE_CHAT_NEW_SESSION_VALUE,
-      chatId,
-      welcomeCardMessageId || undefined,
-      senderId
-    );
-    await this.safeReply(messageId, chatId, getHelpText());
-
+  private async pushFirstContactGuidance(chatId: string, senderId: string, _messageId: string): Promise<void> {
+    // 「三合一」：欢迎语 + 建群入口 + 控制面板合并成一张卡，不再单独发欢迎卡和帮助长文。
+    // 帮助长文改为按需 /help 触发；建群入口降级为按钮，点击才弹完整建群卡（走 create_chat action）。
     try {
-      await commandHandler.pushPanelCard(chatId, 'p2p');
+      await commandHandler.pushWelcomePanelCard(chatId, senderId);
     } catch (error) {
-      console.warn('[P2P] 发送私聊控制面板失败:', error);
+      console.warn('[P2P] 发送私聊欢迎面板失败:', error);
     }
   }
 
