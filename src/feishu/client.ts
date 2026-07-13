@@ -619,7 +619,10 @@ class FeishuClient extends EventEmitter {
         }
       }
 
-      if (parsedContent) {
+      // interactive（卡片）里的 image_key 是卡片 UI 元素图 / 降级占位图，
+      // 不是消息资源，走 messageResource 接口下载会 400。跳过附件收集，
+      // 文字仍由 extractTextFromInteractive 提取，不受影响。
+      if (parsedContent && msgType !== 'interactive') {
         const collected = collectAttachmentsFromContent(parsedContent);
         for (const item of collected) {
           addAttachment(item);
